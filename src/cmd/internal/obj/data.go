@@ -46,12 +46,7 @@ func (s *LSym) Grow(lsiz int64) {
 	if len(s.P) >= siz {
 		return
 	}
-	// TODO(dfc) append cap-len at once, rather than
-	// one byte at a time.
-	for cap(s.P) < siz {
-		s.P = append(s.P[:cap(s.P)], 0)
-	}
-	s.P = s.P[:siz]
+	s.P = append(s.P, make([]byte, siz-len(s.P))...)
 }
 
 // GrowCap increases the capacity of s.P to c.
@@ -120,7 +115,8 @@ func (s *LSym) WriteInt(ctxt *Link, off int64, siz int, i int64) {
 // WriteAddr writes an address of size siz into s at offset off.
 // rsym and roff specify the relocation for the address.
 func (s *LSym) WriteAddr(ctxt *Link, off int64, siz int, rsym *LSym, roff int64) {
-	if siz != ctxt.Arch.PtrSize {
+	// Allow 4-byte addresses for DWARF.
+	if siz != ctxt.Arch.PtrSize && siz != 4 {
 		ctxt.Diag("WriteAddr: bad address size %d in %s", siz, s.Name)
 	}
 	s.prepwrite(ctxt, off, siz)
@@ -184,6 +180,9 @@ func (s *LSym) WriteBytes(ctxt *Link, off int64, b []byte) int64 {
 }
 
 func Addrel(s *LSym) *Reloc {
+	if s.R == nil {
+		s.R = make([]Reloc, 0, 4)
+	}
 	s.R = append(s.R, Reloc{})
 	return &s.R[len(s.R)-1]
 }

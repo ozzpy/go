@@ -131,7 +131,7 @@ func GetBuildID(binary io.ReaderAt) ([]byte, error) {
 				if buildID == nil {
 					buildID = note.Desc
 				} else {
-					return nil, fmt.Errorf("multiple build ids found, don't know which to use!")
+					return nil, fmt.Errorf("multiple build ids found, don't know which to use")
 				}
 			}
 		}
@@ -208,17 +208,17 @@ func GetBase(fh *elf.FileHeader, loadSegment *elf.ProgHeader, stextOffset *uint6
 		if loadSegment.Vaddr == start-offset {
 			return offset, nil
 		}
-		if start >= loadSegment.Vaddr && limit > start && (offset == 0 || offset == pageOffsetPpc64) {
+		if start >= loadSegment.Vaddr && limit > start && (offset == 0 || offset == pageOffsetPpc64 || offset == start) {
 			// Some kernels look like:
 			//       VADDR=0xffffffff80200000
 			// stextOffset=0xffffffff80200198
 			//       Start=0xffffffff83200000
 			//       Limit=0xffffffff84200000
-			//      Offset=0 (0xc000000000000000 for PowerPC64)
+			//      Offset=0 (0xc000000000000000 for PowerPC64) (== Start for ASLR kernel)
 			// So the base should be:
 			if stextOffset != nil && (start%pageSize) == (*stextOffset%pageSize) {
 				// perf uses the address of _stext as start. Some tools may
-				// adjust for this before calling GetBase, in which case the the page
+				// adjust for this before calling GetBase, in which case the page
 				// alignment should be different from that of stextOffset.
 				return start - *stextOffset, nil
 			}
@@ -240,17 +240,38 @@ func GetBase(fh *elf.FileHeader, loadSegment *elf.ProgHeader, stextOffset *uint6
 		}
 		return start, nil
 	case elf.ET_DYN:
-		if offset != 0 {
-			if loadSegment == nil || loadSegment.Vaddr == 0 {
-				return start - offset, nil
-			}
-			return 0, fmt.Errorf("Don't know how to handle mapping. Offset=%x, vaddr=%x",
-				offset, loadSegment.Vaddr)
-		}
+		// The process mapping information, start = start of virtual address range,
+		// and offset = offset in the executable file of the start address, tells us
+		// that a runtime virtual address x maps to a file offset
+		// fx = x - start + offset.
 		if loadSegment == nil {
-			return start, nil
+			return start - offset, nil
 		}
-		return start - loadSegment.Vaddr, nil
+		// The program header, if not nil, indicates the offset in the file where
+		// the executable segment is located (loadSegment.Off), and the base virtual
+		// address where the first byte of the segment is loaded
+		// (loadSegment.Vaddr). A file offset fx maps to a virtual (symbol) address
+		// sx = fx - loadSegment.Off + loadSegment.Vaddr.
+		//
+		// Thus, a runtime virtual address x maps to a symbol address
+		// sx = x - start + offset - loadSegment.Off + loadSegment.Vaddr.
+		return start - offset + loadSegment.Off - loadSegment.Vaddr, nil
 	}
 	return 0, fmt.Errorf("Don't know how to handle FileHeader.Type %v", fh.Type)
+}
+
+// FindTextProgHeader finds the program segment header containing the .text
+// section or nil if the segment cannot be found.
+func FindTextProgHeader(f *elf.File) *elf.ProgHeader {
+	for _, s := range f.Sections {
+		if s.Name == ".text" {
+			// Find the LOAD segment containing the .text section.
+			for _, p := range f.Progs {
+				if p.Type == elf.PT_LOAD && p.Flags&elf.PF_X != 0 && s.Addr >= p.Vaddr && s.Addr < p.Vaddr+p.Memsz {
+					return &p.ProgHeader
+				}
+			}
+		}
+	}
+	return nil
 }

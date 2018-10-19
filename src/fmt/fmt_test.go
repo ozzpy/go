@@ -131,6 +131,14 @@ func (byteFormatter) Format(f State, _ rune) {
 
 var byteFormatterSlice = []byteFormatter{'h', 'e', 'l', 'l', 'o'}
 
+type writeStringFormatter string
+
+func (sf writeStringFormatter) Format(f State, c rune) {
+	if sw, ok := f.(io.StringWriter); ok {
+		sw.WriteString("***" + string(sf) + "***")
+	}
+}
+
 var fmtTests = []struct {
 	fmt string
 	val interface{}
@@ -677,6 +685,13 @@ var fmtTests = []struct {
 	{"%#v", []int32(nil), "[]int32(nil)"},
 	{"%#v", 1.2345678, "1.2345678"},
 	{"%#v", float32(1.2345678), "1.2345678"},
+
+	// Whole number floats are printed without decimals. See Issue 27634.
+	{"%#v", 1.0, "1"},
+	{"%#v", 1000000.0, "1e+06"},
+	{"%#v", float32(1.0), "1"},
+	{"%#v", float32(1000000.0), "1e+06"},
+
 	// Only print []byte and []uint8 as type []byte if they appear at the top level.
 	{"%#v", []byte(nil), "[]byte(nil)"},
 	{"%#v", []uint8(nil), "[]byte(nil)"},
@@ -848,13 +863,8 @@ var fmtTests = []struct {
 	// Extra argument errors should format without flags set.
 	{"%010.2", "12345", "%!(NOVERB)%!(EXTRA string=12345)"},
 
-	// The "<nil>" show up because maps are printed by
-	// first obtaining a list of keys and then looking up
-	// each key. Since NaNs can be map keys but cannot
-	// be fetched directly, the lookup fails and returns a
-	// zero reflect.Value, which formats as <nil>.
-	// This test is just to check that it shows the two NaNs at all.
-	{"%v", map[float64]int{NaN: 1, NaN: 2}, "map[NaN:<nil> NaN:<nil>]"},
+	// Test that maps with non-reflexive keys print all keys and values.
+	{"%v", map[float64]int{NaN: 1, NaN: 1}, "map[NaN:1 NaN:1]"},
 
 	// Comparison of padding rules with C printf.
 	/*
@@ -977,6 +987,11 @@ var fmtTests = []struct {
 	// This next case seems wrong, but the docs say the Formatter wins here.
 	{"%#v", byteFormatterSlice, "[]fmt_test.byteFormatter{X, X, X, X, X}"},
 
+	// pp.WriteString
+	{"%s", writeStringFormatter(""), "******"},
+	{"%s", writeStringFormatter("xyz"), "***xyz***"},
+	{"%s", writeStringFormatter("⌘/⌘"), "***⌘/⌘***"},
+
 	// reflect.Value handled specially in Go 1.5, making it possible to
 	// see inside non-exported fields (which cannot be accessed with Interface()).
 	// Issue 8965.
@@ -1015,7 +1030,7 @@ var fmtTests = []struct {
 	{"%☠", &[]interface{}{I(1), G(2)}, "&[%!☠(fmt_test.I=1) %!☠(fmt_test.G=2)]"},
 	{"%☠", SI{&[]interface{}{I(1), G(2)}}, "{%!☠(*[]interface {}=&[1 2])}"},
 	{"%☠", reflect.Value{}, "<invalid reflect.Value>"},
-	{"%☠", map[float64]int{NaN: 1}, "map[%!☠(float64=NaN):%!☠(<nil>)]"},
+	{"%☠", map[float64]int{NaN: 1}, "map[%!☠(float64=NaN):%!☠(int=1)]"},
 }
 
 // zeroFill generates zero-filled strings of the specified width. The length
@@ -1197,6 +1212,14 @@ func BenchmarkSprintfTruncateString(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			Sprintf("%.3s", "日本語日本語日本語")
+		}
+	})
+}
+
+func BenchmarkSprintfSlowParsingPath(b *testing.B) {
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			Sprintf("%.v", nil)
 		}
 	})
 }
@@ -1707,12 +1730,14 @@ func TestIsSpace(t *testing.T) {
 	}
 }
 
+func hideFromVet(s string) string { return s }
+
 func TestNilDoesNotBecomeTyped(t *testing.T) {
 	type A struct{}
 	type B struct{}
 	var a *A = nil
 	var b B = B{}
-	got := Sprintf("%s %s %s %s %s", nil, a, nil, b, nil) // go vet should complain about this line.
+	got := Sprintf(hideFromVet("%s %s %s %s %s"), nil, a, nil, b, nil)
 	const expect = "%!s(<nil>) %!s(*fmt_test.A=<nil>) %!s(<nil>) {} %!s(<nil>)"
 	if got != expect {
 		t.Errorf("expected:\n\t%q\ngot:\n\t%q", expect, got)

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd linux netbsd openbsd windows solaris
+// +build aix darwin dragonfly freebsd linux netbsd openbsd windows solaris
 
 package poll
 
@@ -101,6 +101,10 @@ func (pd *pollDesc) waitCanceled(mode int) {
 	runtime_pollWaitCanceled(pd.runtimeCtx, mode)
 }
 
+func (pd *pollDesc) pollable() bool {
+	return pd.runtimeCtx != 0
+}
+
 func convertErr(res int, isFile bool) error {
 	switch res {
 	case 0:
@@ -143,11 +147,11 @@ func setDeadlineImpl(fd *FD, t time.Time, mode int) error {
 	if err := fd.incref(); err != nil {
 		return err
 	}
+	defer fd.decref()
 	if fd.pd.runtimeCtx == 0 {
-		return errors.New("file type does not support deadlines")
+		return ErrNoDeadline
 	}
 	runtime_pollSetDeadline(fd.pd.runtimeCtx, d, mode)
-	fd.decref()
 	return nil
 }
 

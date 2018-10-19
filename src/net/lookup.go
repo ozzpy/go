@@ -8,13 +8,14 @@ import (
 	"context"
 	"internal/nettrace"
 	"internal/singleflight"
+	"sync"
 )
 
 // protocols contains minimal mappings between internet protocol
 // names and numbers for platforms that don't have a complete list of
 // protocol numbers.
 //
-// See http://www.iana.org/assignments/protocol-numbers
+// See https://www.iana.org/assignments/protocol-numbers
 //
 // On Unix, this map is augmented by readProtocols via lookupProtocol.
 var protocols = map[string]int{
@@ -28,6 +29,9 @@ var protocols = map[string]int{
 // services contains minimal mappings between services names and port
 // numbers for platforms that don't have a complete list of port numbers
 // (some Solaris distros, nacl, etc).
+//
+// See https://www.iana.org/assignments/service-names-port-numbers
+//
 // On Unix, this map is augmented by readServices via goLookupPort.
 var services = map[string]map[string]int{
 	"udp": {
@@ -50,6 +54,10 @@ var services = map[string]map[string]int{
 	},
 }
 
+// dnsWaitGroup can be used by tests to wait for all DNS goroutines to
+// complete. This avoids races on the test hooks.
+var dnsWaitGroup sync.WaitGroup
+
 const maxProtoLength = len("RSVP-E2E-IGNORE") + 10 // with room to grow
 
 func lookupProtocolMap(name string) (int, error) {
@@ -63,7 +71,12 @@ func lookupProtocolMap(name string) (int, error) {
 	return proto, nil
 }
 
-const maxServiceLength = len("mobility-header") + 10 // with room to grow
+// maxPortBufSize is the longest reasonable name of a service
+// (non-numeric port).
+// Currently the longest known IANA-unregistered name is
+// "mobility-header", so we use that length, plus some slop in case
+// something longer is added in the future.
+const maxPortBufSize = len("mobility-header") + 10
 
 func lookupPortMap(network, service string) (port int, error error) {
 	switch network {
@@ -74,7 +87,7 @@ func lookupPortMap(network, service string) (port int, error error) {
 	}
 
 	if m, ok := services[network]; ok {
-		var lowerService [maxServiceLength]byte
+		var lowerService [maxPortBufSize]byte
 		n := copy(lowerService[:], service)
 		lowerASCIIBytes(lowerService[:n])
 		if port, ok := m[string(lowerService[:n])]; ok && n == len(service) {
@@ -109,15 +122,34 @@ type Resolver struct {
 
 	// Dial optionally specifies an alternate dialer for use by
 	// Go's built-in DNS resolver to make TCP and UDP connections
-	// to DNS services. The provided addr will always be an IP
-	// address and not a hostname.
-	// The Conn returned must be a *TCPConn or *UDPConn as
-	// requested by the network parameter. If nil, the default
-	// dialer is used.
-	Dial func(ctx context.Context, network, addr string) (Conn, error)
+	// to DNS services. The host in the address parameter will
+	// always be a literal IP address and not a host name, and the
+	// port in the address parameter will be a literal port number
+	// and not a service name.
+	// If the Conn returned is also a PacketConn, sent and received DNS
+	// messages must adhere to RFC 1035 section 4.2.1, "UDP usage".
+	// Otherwise, DNS messages transmitted over Conn must adhere
+	// to RFC 7766 section 5, "Transport Protocol Selection".
+	// If nil, the default dialer is used.
+	Dial func(ctx context.Context, network, address string) (Conn, error)
+
+	// lookupGroup merges LookupIPAddr calls together for lookups for the same
+	// host. The lookupGroup key is the LookupIPAddr.host argument.
+	// The return values are ([]IPAddr, error).
+	lookupGroup singleflight.Group
 
 	// TODO(bradfitz): optional interface impl override hook
 	// TODO(bradfitz): Timeout time.Duration?
+}
+
+func (r *Resolver) preferGo() bool     { return r != nil && r.PreferGo }
+func (r *Resolver) strictErrors() bool { return r != nil && r.StrictErrors }
+
+func (r *Resolver) getLookupGroup() *singleflight.Group {
+	if r == nil {
+		return &DefaultResolver.lookupGroup
+	}
+	return &r.lookupGroup
 }
 
 // LookupHost looks up the given host using the local resolver.
@@ -130,11 +162,11 @@ func LookupHost(host string) (addrs []string, err error) {
 // It returns a slice of that host's addresses.
 func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string, err error) {
 	// Make sure that no matter what we do later, host=="" is rejected.
-	// ParseIP, for example, does accept empty strings.
+	// parseIP, for example, does accept empty strings.
 	if host == "" {
 		return nil, &DNSError{Err: errNoSuchHost.Error(), Name: host}
 	}
-	if ip := ParseIP(host); ip != nil {
+	if ip, _ := parseIPZone(host); ip != nil {
 		return []string{host}, nil
 	}
 	return r.lookupHost(ctx, host)
@@ -158,12 +190,12 @@ func LookupIP(host string) ([]IP, error) {
 // It returns a slice of that host's IPv4 and IPv6 addresses.
 func (r *Resolver) LookupIPAddr(ctx context.Context, host string) ([]IPAddr, error) {
 	// Make sure that no matter what we do later, host=="" is rejected.
-	// ParseIP, for example, does accept empty strings.
+	// parseIP, for example, does accept empty strings.
 	if host == "" {
 		return nil, &DNSError{Err: errNoSuchHost.Error(), Name: host}
 	}
-	if ip := ParseIP(host); ip != nil {
-		return []IPAddr{{IP: ip}}, nil
+	if ip, zone := parseIPZone(host); ip != nil {
+		return []IPAddr{{IP: ip, Zone: zone}}, nil
 	}
 	trace, _ := ctx.Value(nettrace.TraceKey{}).(*nettrace.Trace)
 	if trace != nil && trace.DNSStart != nil {
@@ -177,23 +209,45 @@ func (r *Resolver) LookupIPAddr(ctx context.Context, host string) ([]IPAddr, err
 		resolverFunc = alt
 	}
 
-	ch := lookupGroup.DoChan(host, func() (interface{}, error) {
-		return testHookLookupIP(ctx, resolverFunc, host)
+	// We don't want a cancelation of ctx to affect the
+	// lookupGroup operation. Otherwise if our context gets
+	// canceled it might cause an error to be returned to a lookup
+	// using a completely different context.
+	lookupGroupCtx, lookupGroupCancel := context.WithCancel(context.Background())
+
+	dnsWaitGroup.Add(1)
+	ch, called := r.getLookupGroup().DoChan(host, func() (interface{}, error) {
+		defer dnsWaitGroup.Done()
+		return testHookLookupIP(lookupGroupCtx, resolverFunc, host)
 	})
+	if !called {
+		dnsWaitGroup.Done()
+	}
 
 	select {
 	case <-ctx.Done():
-		// The DNS lookup timed out for some reason. Force
-		// future requests to start the DNS lookup again
-		// rather than waiting for the current lookup to
-		// complete. See issue 8602.
+		// Our context was canceled. If we are the only
+		// goroutine looking up this key, then drop the key
+		// from the lookupGroup and cancel the lookup.
+		// If there are other goroutines looking up this key,
+		// let the lookup continue uncanceled, and let later
+		// lookups with the same key share the result.
+		// See issues 8602, 20703, 22724.
+		if r.getLookupGroup().ForgetUnshared(host) {
+			lookupGroupCancel()
+		} else {
+			go func() {
+				<-ch
+				lookupGroupCancel()
+			}()
+		}
 		err := mapErr(ctx.Err())
-		lookupGroup.Forget(host)
 		if trace != nil && trace.DNSDone != nil {
 			trace.DNSDone(nil, false, err)
 		}
 		return nil, err
 	case r := <-ch:
+		lookupGroupCancel()
 		if trace != nil && trace.DNSDone != nil {
 			addrs, _ := r.Val.([]IPAddr)
 			trace.DNSDone(ipAddrsEface(addrs), r.Shared, r.Err)
@@ -201,12 +255,6 @@ func (r *Resolver) LookupIPAddr(ctx context.Context, host string) ([]IPAddr, err
 		return lookupIPReturn(r.Val, r.Err, r.Shared)
 	}
 }
-
-// lookupGroup merges LookupIPAddr calls together for lookups
-// for the same host. The lookupGroup key is is the LookupIPAddr.host
-// argument.
-// The return values are ([]IPAddr, error).
-var lookupGroup singleflight.Group
 
 // lookupIPReturn turns the return values from singleflight.Do into
 // the return values from LookupIP.

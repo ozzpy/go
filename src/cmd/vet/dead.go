@@ -4,7 +4,7 @@
 //
 // Simplified dead code detector. Used for skipping certain checks
 // on unreachable code (for instance, shift checks on arch-specific code).
-//
+
 package main
 
 import (
@@ -45,7 +45,7 @@ func (f *File) updateDead(node ast.Node) {
 				}
 				for _, expr := range cc.List {
 					v := f.pkg.types[expr].Value
-					if v == nil || constant.BoolVal(v) {
+					if v == nil || v.Kind() != constant.Bool || constant.BoolVal(v) {
 						continue BodyLoopBool
 					}
 				}

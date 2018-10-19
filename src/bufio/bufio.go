@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package bufio implements buffered I/O.  It wraps an io.Reader or io.Writer
+// Package bufio implements buffered I/O. It wraps an io.Reader or io.Writer
 // object, creating another object (Reader or Writer) that also implements
 // the interface but provides buffering and some help for textual I/O.
 package bufio
@@ -61,6 +61,9 @@ func NewReaderSize(rd io.Reader, size int) *Reader {
 func NewReader(rd io.Reader) *Reader {
 	return NewReaderSize(rd, defaultBufSize)
 }
+
+// Size returns the size of the underlying buffer in bytes.
+func (b *Reader) Size() int { return len(b.buf) }
 
 // Reset discards any buffered data, resets all state, and switches
 // the buffered reader to read from r.
@@ -311,9 +314,11 @@ func (b *Reader) Buffered() int { return b.w - b.r }
 // ReadBytes or ReadString instead.
 // ReadSlice returns err != nil if and only if line does not end in delim.
 func (b *Reader) ReadSlice(delim byte) (line []byte, err error) {
+	s := 0 // search start index
 	for {
 		// Search buffer.
-		if i := bytes.IndexByte(b.buf[b.r:b.w], delim); i >= 0 {
+		if i := bytes.IndexByte(b.buf[b.r+s:b.w], delim); i >= 0 {
+			i += s
 			line = b.buf[b.r : b.r+i+1]
 			b.r += i + 1
 			break
@@ -334,6 +339,8 @@ func (b *Reader) ReadSlice(delim byte) (line []byte, err error) {
 			err = ErrBufferFull
 			break
 		}
+
+		s = b.w - b.r // do not rescan area we scanned before
 
 		b.fill() // buffer is not full
 	}
@@ -458,6 +465,9 @@ func (b *Reader) ReadString(delim byte) (string, error) {
 }
 
 // WriteTo implements io.WriterTo.
+// This may make multiple calls to the Read method of the underlying Reader.
+// If the underlying reader supports the WriteTo method,
+// this calls the underlying WriteTo without buffering.
 func (b *Reader) WriteTo(w io.Writer) (n int64, err error) {
 	n, err = b.writeBuf(w)
 	if err != nil {
@@ -546,6 +556,9 @@ func NewWriterSize(w io.Writer, size int) *Writer {
 func NewWriter(w io.Writer) *Writer {
 	return NewWriterSize(w, defaultBufSize)
 }
+
+// Size returns the size of the underlying buffer in bytes.
+func (b *Writer) Size() int { return len(b.buf) }
 
 // Reset discards any unflushed buffered data, clears any error, and
 // resets b to write its output to w.
@@ -677,7 +690,9 @@ func (b *Writer) WriteString(s string) (int, error) {
 	return nn, nil
 }
 
-// ReadFrom implements io.ReaderFrom.
+// ReadFrom implements io.ReaderFrom. If the underlying writer
+// supports the ReadFrom method, and b has no buffered data yet,
+// this calls the underlying ReadFrom without buffering.
 func (b *Writer) ReadFrom(r io.Reader) (n int64, err error) {
 	if b.Buffered() == 0 {
 		if w, ok := b.wr.(io.ReaderFrom); ok {

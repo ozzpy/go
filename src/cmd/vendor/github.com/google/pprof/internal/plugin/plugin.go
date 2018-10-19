@@ -17,6 +17,7 @@ package plugin
 
 import (
 	"io"
+	"net/http"
 	"regexp"
 	"time"
 
@@ -31,6 +32,16 @@ type Options struct {
 	Sym     Symbolizer
 	Obj     ObjTool
 	UI      UI
+
+	// HTTPServer is a function that should block serving http requests,
+	// including the handlers specfied in args.  If non-nil, pprof will
+	// invoke this function if necessary to provide a web interface.
+	//
+	// If HTTPServer is nil, pprof will use its own internal HTTP server.
+	//
+	// A common use for a custom HTTPServer is to provide custom
+	// authentication checks.
+	HTTPServer func(args *HTTPServerArgs) error
 }
 
 // Writer provides a mechanism to write data under a certain name,
@@ -181,7 +192,24 @@ type UI interface {
 	// interactive terminal (as opposed to being redirected to a file).
 	IsTerminal() bool
 
+	// WantBrowser indicates whether a browser should be opened with the -http option.
+	WantBrowser() bool
+
 	// SetAutoComplete instructs the UI to call complete(cmd) to obtain
 	// the auto-completion of cmd, if the UI supports auto-completion at all.
 	SetAutoComplete(complete func(string) string)
+}
+
+// HTTPServerArgs contains arguments needed by an HTTP server that
+// is exporting a pprof web interface.
+type HTTPServerArgs struct {
+	// Hostport contains the http server address (derived from flags).
+	Hostport string
+
+	Host string // Host portion of Hostport
+	Port int    // Port portion of Hostport
+
+	// Handlers maps from URL paths to the handler to invoke to
+	// serve that path.
+	Handlers map[string]http.Handler
 }

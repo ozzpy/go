@@ -98,8 +98,8 @@ func TestFuzz(t *testing.T) {
 
 func randomBytes(n int, rand *rand.Rand) []byte {
 	r := make([]byte, n)
-	for i := 0; i < n; i++ {
-		r[i] = byte(rand.Int31())
+	if _, err := rand.Read(r); err != nil {
+		panic("rand.Read failed: " + err.Error())
 	}
 	return r
 }
@@ -116,7 +116,11 @@ func (*clientHelloMsg) Generate(rand *rand.Rand, size int) reflect.Value {
 	m.sessionId = randomBytes(rand.Intn(32), rand)
 	m.cipherSuites = make([]uint16, rand.Intn(63)+1)
 	for i := 0; i < len(m.cipherSuites); i++ {
-		m.cipherSuites[i] = uint16(rand.Int31())
+		cs := uint16(rand.Int31())
+		if cs == scsvRenegotiation {
+			cs += 1
+		}
+		m.cipherSuites[i] = cs
 	}
 	m.compressionMethods = randomBytes(rand.Intn(63)+1, rand)
 	if rand.Intn(10) > 5 {
@@ -141,7 +145,7 @@ func (*clientHelloMsg) Generate(rand *rand.Rand, size int) reflect.Value {
 		}
 	}
 	if rand.Intn(10) > 5 {
-		m.signatureAndHashes = supportedSignatureAlgorithms
+		m.supportedSignatureAlgorithms = supportedSignatureAlgorithms
 	}
 	m.alpnProtocols = make([]string, rand.Intn(5))
 	for i := range m.alpnProtocols {
@@ -184,7 +188,7 @@ func (*serverHelloMsg) Generate(rand *rand.Rand, size int) reflect.Value {
 		numSCTs := rand.Intn(4)
 		m.scts = make([][]byte, numSCTs)
 		for i := range m.scts {
-			m.scts[i] = randomBytes(rand.Intn(500), rand)
+			m.scts[i] = randomBytes(rand.Intn(500)+1, rand)
 		}
 	}
 
@@ -267,8 +271,7 @@ func (*sessionState) Generate(rand *rand.Rand, size int) reflect.Value {
 }
 
 func TestRejectEmptySCTList(t *testing.T) {
-	// https://tools.ietf.org/html/rfc6962#section-3.3.1 specifies that
-	// empty SCT lists are invalid.
+	// RFC 6962, Section 3.3.1 specifies that empty SCT lists are invalid.
 
 	var random [32]byte
 	sct := []byte{0x42, 0x42, 0x42, 0x42}

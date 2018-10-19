@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build darwin dragonfly freebsd linux netbsd openbsd solaris
+// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
 
 // Fork, exec, wait, etc.
 
@@ -242,6 +242,14 @@ func StartProcess(argv0 string, argv []string, attr *ProcAttr) (pid int, handle 
 	return pid, 0, err
 }
 
+// Implemented in runtime package.
+func runtime_BeforeExec()
+func runtime_AfterExec()
+
+// execveLibc is non-nil on OS using libc syscall, set to execve in exec_libc.go; this
+// avoids a build dependency for other platforms.
+var execveLibc func(path uintptr, argv uintptr, envp uintptr) (err Errno)
+
 // Exec invokes the execve(2) system call.
 func Exec(argv0 string, argv []string, envv []string) (err error) {
 	argv0p, err := BytePtrFromString(argv0)
@@ -256,9 +264,21 @@ func Exec(argv0 string, argv []string, envv []string) (err error) {
 	if err != nil {
 		return err
 	}
-	_, _, err1 := RawSyscall(SYS_EXECVE,
-		uintptr(unsafe.Pointer(argv0p)),
-		uintptr(unsafe.Pointer(&argvp[0])),
-		uintptr(unsafe.Pointer(&envvp[0])))
-	return Errno(err1)
+	runtime_BeforeExec()
+
+	var err1 Errno
+	if runtime.GOOS == "solaris" || runtime.GOOS == "aix" {
+		// RawSyscall should never be used on Solaris or AIX.
+		err1 = execveLibc(
+			uintptr(unsafe.Pointer(argv0p)),
+			uintptr(unsafe.Pointer(&argvp[0])),
+			uintptr(unsafe.Pointer(&envvp[0])))
+	} else {
+		_, _, err1 = RawSyscall(SYS_EXECVE,
+			uintptr(unsafe.Pointer(argv0p)),
+			uintptr(unsafe.Pointer(&argvp[0])),
+			uintptr(unsafe.Pointer(&envvp[0])))
+	}
+	runtime_AfterExec()
+	return err1
 }

@@ -21,6 +21,12 @@ func TestRoundUp(t *testing.T) {
 	}
 }
 
+// will be initialized with {0, 255, 255, ..., 255}
+var padding255Bad = [256]byte{}
+
+// will be initialized with {255, 255, 255, ..., 255}
+var padding255Good = [256]byte{255}
+
 var paddingTests = []struct {
 	in          []byte
 	good        bool
@@ -36,9 +42,15 @@ var paddingTests = []struct {
 	{[]byte{1, 4, 4, 4, 4, 4}, true, 1},
 	{[]byte{5, 5, 5, 5, 5, 5}, true, 0},
 	{[]byte{6, 6, 6, 6, 6, 6}, false, 0},
+	{padding255Bad[:], false, 0},
+	{padding255Good[:], true, 0},
 }
 
 func TestRemovePadding(t *testing.T) {
+	for i := 1; i < len(padding255Bad); i++ {
+		padding255Bad[i] = 255
+		padding255Good[i] = 255
+	}
 	for i, test := range paddingTests {
 		paddingLen, good := extractPadding(test.in)
 		expectedGood := byte(255)
@@ -122,12 +134,13 @@ func TestCertificateSelection(t *testing.T) {
 
 // Run with multiple crypto configs to test the logic for computing TLS record overheads.
 func runDynamicRecordSizingTest(t *testing.T, config *Config) {
-	clientConn, serverConn := net.Pipe()
+	clientConn, serverConn := localPipe(t)
 
 	serverConfig := config.Clone()
 	serverConfig.DynamicRecordSizingDisabled = false
 	tlsConn := Server(serverConn, serverConfig)
 
+	handshakeDone := make(chan struct{})
 	recordSizesChan := make(chan []int, 1)
 	go func() {
 		// This goroutine performs a TLS handshake over clientConn and
@@ -141,6 +154,7 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 			t.Errorf("Error from client handshake: %v", err)
 			return
 		}
+		close(handshakeDone)
 
 		var recordHeader [recordHeaderLen]byte
 		var record []byte
@@ -180,6 +194,7 @@ func runDynamicRecordSizingTest(t *testing.T, config *Config) {
 	if err := tlsConn.Handshake(); err != nil {
 		t.Fatalf("Error from server handshake: %s", err)
 	}
+	<-handshakeDone
 
 	// The server writes these plaintexts in order.
 	plaintext := bytes.Join([][]byte{
@@ -257,7 +272,7 @@ func (conn *hairpinConn) Close() error {
 func TestHairpinInClose(t *testing.T) {
 	// This tests that the underlying net.Conn can call back into the
 	// tls.Conn when being closed without deadlocking.
-	client, server := net.Pipe()
+	client, server := localPipe(t)
 	defer server.Close()
 	defer client.Close()
 

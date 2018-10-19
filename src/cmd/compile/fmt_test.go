@@ -73,6 +73,9 @@ type File struct {
 }
 
 func TestFormats(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping in short mode")
+	}
 	testenv.MustHaveGoBuild(t) // more restrictive than necessary, but that's ok
 
 	// process all directories
@@ -229,7 +232,7 @@ func TestFormats(t *testing.T) {
 			}
 		}
 		if mismatch {
-			t.Errorf("knownFormats is out of date; please run with -v to regenerate")
+			t.Errorf("knownFormats is out of date; please 'go test -v fmt_test.go > foo', then extract new definition of knownFormats from foo")
 		}
 	}
 
@@ -419,7 +422,7 @@ func stringVal(tv types.TypeAndValue) (string, bool) {
 // formatIter iterates through the string s in increasing
 // index order and calls f for each format specifier '%..v'.
 // The arguments for f describe the specifier's index range.
-// If a format specifier contains a  "*", f is called with
+// If a format specifier contains a "*", f is called with
 // the index range for "*" alone, before being called for
 // the entire specifier. The result of f is the index of
 // the rune at which iteration continues.
@@ -571,14 +574,15 @@ var knownFormats = map[string]string{
 	"*cmd/compile/internal/ssa.Block %s":              "",
 	"*cmd/compile/internal/ssa.Block %v":              "",
 	"*cmd/compile/internal/ssa.Func %s":               "",
+	"*cmd/compile/internal/ssa.Func %v":               "",
+	"*cmd/compile/internal/ssa.Register %s":           "",
+	"*cmd/compile/internal/ssa.Register %v":           "",
 	"*cmd/compile/internal/ssa.SparseTreeNode %v":     "",
 	"*cmd/compile/internal/ssa.Value %s":              "",
 	"*cmd/compile/internal/ssa.Value %v":              "",
 	"*cmd/compile/internal/ssa.sparseTreeMapEntry %v": "",
 	"*cmd/compile/internal/types.Field %p":            "",
 	"*cmd/compile/internal/types.Field %v":            "",
-	"*cmd/compile/internal/types.Sym %+v":             "",
-	"*cmd/compile/internal/types.Sym %-v":             "",
 	"*cmd/compile/internal/types.Sym %0S":             "",
 	"*cmd/compile/internal/types.Sym %S":              "",
 	"*cmd/compile/internal/types.Sym %p":              "",
@@ -594,23 +598,31 @@ var knownFormats = map[string]string{
 	"*cmd/compile/internal/types.Type %v":             "",
 	"*cmd/internal/obj.Addr %v":                       "",
 	"*cmd/internal/obj.LSym %v":                       "",
-	"*cmd/internal/obj.Prog %s":                       "",
 	"*math/big.Int %#x":                               "",
 	"*math/big.Int %s":                                "",
+	"*math/big.Int %v":                                "",
 	"[16]byte %x":                                     "",
 	"[]*cmd/compile/internal/gc.Node %v":              "",
-	"[]*cmd/compile/internal/gc.Sig %#v":              "",
+	"[]*cmd/compile/internal/ssa.Block %v":            "",
 	"[]*cmd/compile/internal/ssa.Value %v":            "",
+	"[][]string %q":                                   "",
 	"[]byte %s":                                       "",
 	"[]byte %x":                                       "",
 	"[]cmd/compile/internal/ssa.Edge %v":              "",
 	"[]cmd/compile/internal/ssa.ID %v":                "",
+	"[]cmd/compile/internal/ssa.posetNode %v":         "",
+	"[]cmd/compile/internal/ssa.posetUndo %v":         "",
+	"[]cmd/compile/internal/syntax.token %s":          "",
 	"[]string %v":                                     "",
+	"[]uint32 %v":                                     "",
 	"bool %v":                                         "",
 	"byte %08b":                                       "",
 	"byte %c":                                         "",
+	"byte %v":                                         "",
 	"cmd/compile/internal/arm.shift %d":               "",
 	"cmd/compile/internal/gc.Class %d":                "",
+	"cmd/compile/internal/gc.Class %s":                "",
+	"cmd/compile/internal/gc.Class %v":                "",
 	"cmd/compile/internal/gc.Ctype %d":                "",
 	"cmd/compile/internal/gc.Ctype %v":                "",
 	"cmd/compile/internal/gc.Level %d":                "",
@@ -626,30 +638,37 @@ var knownFormats = map[string]string{
 	"cmd/compile/internal/gc.Val %v":                  "",
 	"cmd/compile/internal/gc.fmtMode %d":              "",
 	"cmd/compile/internal/gc.initKind %d":             "",
+	"cmd/compile/internal/gc.itag %v":                 "",
 	"cmd/compile/internal/ssa.BranchPrediction %d":    "",
 	"cmd/compile/internal/ssa.Edge %v":                "",
 	"cmd/compile/internal/ssa.GCNode %v":              "",
 	"cmd/compile/internal/ssa.ID %d":                  "",
+	"cmd/compile/internal/ssa.ID %v":                  "",
+	"cmd/compile/internal/ssa.LocPair %s":             "",
+	"cmd/compile/internal/ssa.LocalSlot %s":           "",
 	"cmd/compile/internal/ssa.LocalSlot %v":           "",
-	"cmd/compile/internal/ssa.Location %v":            "",
+	"cmd/compile/internal/ssa.Location %T":            "",
+	"cmd/compile/internal/ssa.Location %s":            "",
 	"cmd/compile/internal/ssa.Op %s":                  "",
 	"cmd/compile/internal/ssa.Op %v":                  "",
 	"cmd/compile/internal/ssa.ValAndOff %s":           "",
+	"cmd/compile/internal/ssa.domain %v":              "",
+	"cmd/compile/internal/ssa.posetNode %v":           "",
+	"cmd/compile/internal/ssa.posetTestOp %v":         "",
 	"cmd/compile/internal/ssa.rbrank %d":              "",
 	"cmd/compile/internal/ssa.regMask %d":             "",
 	"cmd/compile/internal/ssa.register %d":            "",
 	"cmd/compile/internal/syntax.Expr %#v":            "",
 	"cmd/compile/internal/syntax.Node %T":             "",
-	"cmd/compile/internal/syntax.Operator %d":         "",
 	"cmd/compile/internal/syntax.Operator %s":         "",
-	"cmd/compile/internal/syntax.token %d":            "",
+	"cmd/compile/internal/syntax.Pos %s":              "",
+	"cmd/compile/internal/syntax.Pos %v":              "",
+	"cmd/compile/internal/syntax.position %s":         "",
 	"cmd/compile/internal/syntax.token %q":            "",
 	"cmd/compile/internal/syntax.token %s":            "",
 	"cmd/compile/internal/types.EType %d":             "",
 	"cmd/compile/internal/types.EType %s":             "",
 	"cmd/compile/internal/types.EType %v":             "",
-	"cmd/internal/src.Pos %s":                         "",
-	"cmd/internal/src.Pos %v":                         "",
 	"error %v":                                        "",
 	"float64 %.2f":                                    "",
 	"float64 %.3f":                                    "",
@@ -658,6 +677,7 @@ var knownFormats = map[string]string{
 	"int %-12d":                                       "",
 	"int %-6d":                                        "",
 	"int %-8o":                                        "",
+	"int %02d":                                        "",
 	"int %6d":                                         "",
 	"int %c":                                          "",
 	"int %d":                                          "",
@@ -670,6 +690,7 @@ var knownFormats = map[string]string{
 	"int32 %x":                                        "",
 	"int64 %+d":                                       "",
 	"int64 %-10d":                                     "",
+	"int64 %.5d":                                      "",
 	"int64 %X":                                        "",
 	"int64 %d":                                        "",
 	"int64 %v":                                        "",
@@ -678,15 +699,18 @@ var knownFormats = map[string]string{
 	"int8 %x":                                         "",
 	"interface{} %#v":                                 "",
 	"interface{} %T":                                  "",
+	"interface{} %p":                                  "",
 	"interface{} %q":                                  "",
 	"interface{} %s":                                  "",
 	"interface{} %v":                                  "",
 	"map[*cmd/compile/internal/gc.Node]*cmd/compile/internal/ssa.Value %v": "",
+	"map[cmd/compile/internal/ssa.ID]uint32 %v":                            "",
 	"reflect.Type %s":  "",
 	"rune %#U":         "",
 	"rune %c":          "",
 	"string %-*s":      "",
 	"string %-16s":     "",
+	"string %-6s":      "",
 	"string %.*s":      "",
 	"string %q":        "",
 	"string %s":        "",
@@ -696,10 +720,13 @@ var knownFormats = map[string]string{
 	"uint %04x":        "",
 	"uint %5d":         "",
 	"uint %d":          "",
+	"uint %x":          "",
 	"uint16 %d":        "",
 	"uint16 %v":        "",
 	"uint16 %x":        "",
+	"uint32 %#x":       "",
 	"uint32 %d":        "",
+	"uint32 %v":        "",
 	"uint32 %x":        "",
 	"uint64 %08x":      "",
 	"uint64 %d":        "",

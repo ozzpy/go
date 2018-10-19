@@ -74,7 +74,9 @@ func schedule(f *Func) {
 	score := make([]int8, f.NumValues())
 
 	// scheduling order. We queue values in this list in reverse order.
-	var order []*Value
+	// A constant bound allows this to be stack-allocated. 64 is
+	// enough to cover almost every schedule call.
+	order := make([]*Value, 0, 64)
 
 	// maps mem values to the next live memory value
 	nextMem := make([]*Value, f.NumValues())
@@ -88,7 +90,8 @@ func schedule(f *Func) {
 			case v.Op == OpAMD64LoweredGetClosurePtr || v.Op == OpPPC64LoweredGetClosurePtr ||
 				v.Op == OpARMLoweredGetClosurePtr || v.Op == OpARM64LoweredGetClosurePtr ||
 				v.Op == Op386LoweredGetClosurePtr || v.Op == OpMIPS64LoweredGetClosurePtr ||
-				v.Op == OpS390XLoweredGetClosurePtr || v.Op == OpMIPSLoweredGetClosurePtr:
+				v.Op == OpS390XLoweredGetClosurePtr || v.Op == OpMIPSLoweredGetClosurePtr ||
+				v.Op == OpWasmLoweredGetClosurePtr:
 				// We also score GetLoweredClosurePtr as early as possible to ensure that the
 				// context register is not stomped. GetLoweredClosurePtr should only appear
 				// in the entry block where there are no phi functions, so there is no
@@ -100,7 +103,8 @@ func schedule(f *Func) {
 			case v.Op == OpAMD64LoweredNilCheck || v.Op == OpPPC64LoweredNilCheck ||
 				v.Op == OpARMLoweredNilCheck || v.Op == OpARM64LoweredNilCheck ||
 				v.Op == Op386LoweredNilCheck || v.Op == OpMIPS64LoweredNilCheck ||
-				v.Op == OpS390XLoweredNilCheck || v.Op == OpMIPSLoweredNilCheck:
+				v.Op == OpS390XLoweredNilCheck || v.Op == OpMIPSLoweredNilCheck ||
+				v.Op == OpWasmLoweredNilCheck:
 				// Nil checks must come before loads from the same address.
 				score[v.ID] = ScoreNilCheck
 			case v.Op == OpPhi:
@@ -132,19 +136,14 @@ func schedule(f *Func) {
 		}
 	}
 
-	// TODO: make this logic permanent in types.IsMemory?
-	isMem := func(v *Value) bool {
-		return v.Type.IsMemory() || v.Type.IsTuple() && v.Type.FieldType(1).IsMemory()
-	}
-
 	for _, b := range f.Blocks {
 		// Find store chain for block.
 		// Store chains for different blocks overwrite each other, so
 		// the calculated store chain is good only for this block.
 		for _, v := range b.Values {
-			if v.Op != OpPhi && isMem(v) {
+			if v.Op != OpPhi && v.Type.IsMemory() {
 				for _, w := range v.Args {
-					if isMem(w) {
+					if w.Type.IsMemory() {
 						nextMem[w.ID] = v
 					}
 				}
@@ -164,7 +163,7 @@ func schedule(f *Func) {
 					uses[w.ID]++
 				}
 				// Any load must come before the following store.
-				if !isMem(v) && isMem(w) {
+				if !v.Type.IsMemory() && w.Type.IsMemory() {
 					// v is a load.
 					s := nextMem[w.ID]
 					if s == nil || s.Block != b {
@@ -269,7 +268,7 @@ func schedule(f *Func) {
 			}
 		}
 		if len(order) != len(b.Values) {
-			f.Fatalf("schedule does not include all values")
+			f.Fatalf("schedule does not include all values in block %s", b)
 		}
 		for i := 0; i < len(b.Values); i++ {
 			b.Values[i] = order[len(b.Values)-1-i]
@@ -306,7 +305,11 @@ func storeOrder(values []*Value, sset *sparseSet, storeNumber []int32) []*Value 
 	f := values[0].Block.Func
 
 	// find all stores
-	var stores []*Value // members of values that are store values
+
+	// Members of values that are store values.
+	// A constant bound allows this to be stack-allocated. 64 is
+	// enough to cover almost every storeOrder call.
+	stores := make([]*Value, 0, 64)
 	hasNilCheck := false
 	sset.clear() // sset is the set of stores that are used in other values
 	for _, v := range values {
@@ -315,11 +318,7 @@ func storeOrder(values []*Value, sset *sparseSet, storeNumber []int32) []*Value 
 			if v.Op == OpInitMem || v.Op == OpPhi {
 				continue
 			}
-			a := v
-			if v.Op == OpSelect1 {
-				a = a.Args[0]
-			}
-			sset.add(a.MemoryArg().ID) // record that v's memory arg is used
+			sset.add(v.MemoryArg().ID) // record that v's memory arg is used
 		}
 		if v.Op == OpNilCheck {
 			hasNilCheck = true
@@ -335,7 +334,7 @@ func storeOrder(values []*Value, sset *sparseSet, storeNumber []int32) []*Value 
 	for _, v := range stores {
 		if !sset.contains(v.ID) {
 			if last != nil {
-				f.Fatalf("two stores live simutaneously: %v and %v", v, last)
+				f.Fatalf("two stores live simultaneously: %v and %v", v, last)
 			}
 			last = v
 		}
@@ -361,9 +360,6 @@ func storeOrder(values []*Value, sset *sparseSet, storeNumber []int32) []*Value 
 				f.Fatalf("store order is wrong: there are stores before %v", w)
 			}
 			break
-		}
-		if w.Op == OpSelect1 {
-			w = w.Args[0]
 		}
 		w = w.MemoryArg()
 	}

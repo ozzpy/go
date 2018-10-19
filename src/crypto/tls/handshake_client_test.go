@@ -85,7 +85,7 @@ func (o *opensslOutputSink) Write(data []byte) (n int, err error) {
 	o.all = append(o.all, data...)
 
 	for {
-		i := bytes.Index(o.line, []byte{'\n'})
+		i := bytes.IndexByte(o.line, '\n')
 		if i < 0 {
 			break
 		}
@@ -179,7 +179,7 @@ func (test *clientTest) connFromCommand() (conn *recordingConn, child *exec.Cmd,
 	var pemOut bytes.Buffer
 	pem.Encode(&pemOut, &pem.Block{Type: pemType + " PRIVATE KEY", Bytes: derBytes})
 
-	keyPath := tempFile(string(pemOut.Bytes()))
+	keyPath := tempFile(pemOut.String())
 	defer os.Remove(keyPath)
 
 	var command []string
@@ -293,7 +293,7 @@ func (test *clientTest) run(t *testing.T, write bool) {
 		}
 		clientConn = recordingConn
 	} else {
-		clientConn, serverConn = net.Pipe()
+		clientConn, serverConn = localPipe(t)
 	}
 
 	config := test.config
@@ -682,7 +682,7 @@ func TestClientResumption(t *testing.T) {
 	}
 
 	testResumeState := func(test string, didResume bool) {
-		_, hs, err := testHandshake(clientConfig, serverConfig)
+		_, hs, err := testHandshake(t, clientConfig, serverConfig)
 		if err != nil {
 			t.Fatalf("%s: handshake failed: %s", test, err)
 		}
@@ -800,7 +800,7 @@ func TestKeyLog(t *testing.T) {
 	serverConfig := testConfig.Clone()
 	serverConfig.KeyLogWriter = &serverBuf
 
-	c, s := net.Pipe()
+	c, s := localPipe(t)
 	done := make(chan bool)
 
 	go func() {
@@ -838,8 +838,8 @@ func TestKeyLog(t *testing.T) {
 		}
 	}
 
-	checkKeylogLine("client", string(clientBuf.Bytes()))
-	checkKeylogLine("server", string(serverBuf.Bytes()))
+	checkKeylogLine("client", clientBuf.String())
+	checkKeylogLine("server", serverBuf.String())
 }
 
 func TestHandshakeClientALPNMatch(t *testing.T) {
@@ -979,6 +979,24 @@ func TestRenegotiateTwiceRejected(t *testing.T) {
 	runClientTestTLS12(t, test)
 }
 
+func TestHandshakeClientExportKeyingMaterial(t *testing.T) {
+	test := &clientTest{
+		name:    "ExportKeyingMaterial",
+		command: []string{"openssl", "s_server"},
+		config:  testConfig.Clone(),
+		validate: func(state ConnectionState) error {
+			if km, err := state.ExportKeyingMaterial("test", nil, 42); err != nil {
+				return fmt.Errorf("ExportKeyingMaterial failed: %v", err)
+			} else if len(km) != 42 {
+				return fmt.Errorf("Got %d bytes from ExportKeyingMaterial, wanted %d", len(km), 42)
+			}
+			return nil
+		},
+	}
+	runClientTestTLS10(t, test)
+	runClientTestTLS12(t, test)
+}
+
 var hostnameInSNITests = []struct {
 	in, out string
 }{
@@ -1003,7 +1021,7 @@ var hostnameInSNITests = []struct {
 
 func TestHostnameInSNI(t *testing.T) {
 	for _, tt := range hostnameInSNITests {
-		c, s := net.Pipe()
+		c, s := localPipe(t)
 
 		go func(host string) {
 			Client(c, &Config{ServerName: host, InsecureSkipVerify: true}).Handshake()
@@ -1041,7 +1059,7 @@ func TestServerSelectingUnconfiguredCipherSuite(t *testing.T) {
 	// This checks that the server can't select a cipher suite that the
 	// client didn't offer. See #13174.
 
-	c, s := net.Pipe()
+	c, s := localPipe(t)
 	errChan := make(chan error, 1)
 
 	go func() {
@@ -1189,7 +1207,7 @@ func TestVerifyPeerCertificate(t *testing.T) {
 					// callback should still be called but
 					// validatedChains must be empty.
 					if l := len(validatedChains); l != 0 {
-						return errors.New("got len(validatedChains) = 0, wanted zero")
+						return fmt.Errorf("got len(validatedChains) = %d, wanted zero", l)
 					}
 					*called = true
 					return nil
@@ -1210,7 +1228,7 @@ func TestVerifyPeerCertificate(t *testing.T) {
 	}
 
 	for i, test := range tests {
-		c, s := net.Pipe()
+		c, s := localPipe(t)
 		done := make(chan error)
 
 		var clientCalled, serverCalled bool
@@ -1269,7 +1287,7 @@ func (b *brokenConn) Write(data []byte) (int, error) {
 func TestFailedWrite(t *testing.T) {
 	// Test that a write error during the handshake is returned.
 	for _, breakAfter := range []int{0, 1} {
-		c, s := net.Pipe()
+		c, s := localPipe(t)
 		done := make(chan bool)
 
 		go func() {
@@ -1303,7 +1321,7 @@ func (wcc *writeCountingConn) Write(data []byte) (int, error) {
 }
 
 func TestBuffering(t *testing.T) {
-	c, s := net.Pipe()
+	c, s := localPipe(t)
 	done := make(chan bool)
 
 	clientWCC := &writeCountingConn{Conn: c}
@@ -1332,7 +1350,7 @@ func TestBuffering(t *testing.T) {
 }
 
 func TestAlertFlushing(t *testing.T) {
-	c, s := net.Pipe()
+	c, s := localPipe(t)
 	done := make(chan bool)
 
 	clientWCC := &writeCountingConn{Conn: c}
@@ -1381,7 +1399,7 @@ func TestHandshakeRace(t *testing.T) {
 	// order to provide some evidence that there are no races or deadlocks
 	// in the handshake locking.
 	for i := 0; i < 32; i++ {
-		c, s := net.Pipe()
+		c, s := localPipe(t)
 
 		go func() {
 			server := Server(s, testConfig)
@@ -1412,7 +1430,7 @@ func TestHandshakeRace(t *testing.T) {
 		go func() {
 			<-startRead
 			var reply [1]byte
-			if n, err := client.Read(reply[:]); err != nil || n != 1 {
+			if _, err := io.ReadFull(client, reply[:]); err != nil {
 				panic(err)
 			}
 			c.Close()
@@ -1438,18 +1456,22 @@ func TestTLS11SignatureSchemes(t *testing.T) {
 }
 
 var getClientCertificateTests = []struct {
-	setup               func(*Config)
+	setup               func(*Config, *Config)
 	expectedClientError string
 	verify              func(*testing.T, int, *ConnectionState)
 }{
 	{
-		func(clientConfig *Config) {
+		func(clientConfig, serverConfig *Config) {
 			// Returning a Certificate with no certificate data
 			// should result in an empty message being sent to the
 			// server.
+			serverConfig.ClientCAs = nil
 			clientConfig.GetClientCertificate = func(cri *CertificateRequestInfo) (*Certificate, error) {
 				if len(cri.SignatureSchemes) == 0 {
 					panic("empty SignatureSchemes")
+				}
+				if len(cri.AcceptableCAs) != 0 {
+					panic("AcceptableCAs should have been empty")
 				}
 				return new(Certificate), nil
 			}
@@ -1462,7 +1484,7 @@ var getClientCertificateTests = []struct {
 		},
 	},
 	{
-		func(clientConfig *Config) {
+		func(clientConfig, serverConfig *Config) {
 			// With TLS 1.1, the SignatureSchemes should be
 			// synthesised from the supported certificate types.
 			clientConfig.MaxVersion = VersionTLS11
@@ -1481,7 +1503,7 @@ var getClientCertificateTests = []struct {
 		},
 	},
 	{
-		func(clientConfig *Config) {
+		func(clientConfig, serverConfig *Config) {
 			// Returning an error should abort the handshake with
 			// that error.
 			clientConfig.GetClientCertificate = func(cri *CertificateRequestInfo) (*Certificate, error) {
@@ -1493,14 +1515,21 @@ var getClientCertificateTests = []struct {
 		},
 	},
 	{
-		func(clientConfig *Config) {
+		func(clientConfig, serverConfig *Config) {
 			clientConfig.GetClientCertificate = func(cri *CertificateRequestInfo) (*Certificate, error) {
-				return &testConfig.Certificates[0], nil
+				if len(cri.AcceptableCAs) == 0 {
+					panic("empty AcceptableCAs")
+				}
+				cert := &Certificate{
+					Certificate: [][]byte{testRSACertificate},
+					PrivateKey:  testRSAPrivateKey,
+				}
+				return cert, nil
 			}
 		},
 		"",
 		func(t *testing.T, testNum int, cs *ConnectionState) {
-			if l := len(cs.VerifiedChains); l != 0 {
+			if len(cs.VerifiedChains) == 0 {
 				t.Errorf("#%d: expected some verified chains, but found none", testNum)
 			}
 		},
@@ -1515,20 +1544,22 @@ func TestGetClientCertificate(t *testing.T) {
 
 	for i, test := range getClientCertificateTests {
 		serverConfig := testConfig.Clone()
-		serverConfig.ClientAuth = RequestClientCert
+		serverConfig.ClientAuth = VerifyClientCertIfGiven
 		serverConfig.RootCAs = x509.NewCertPool()
 		serverConfig.RootCAs.AddCert(issuer)
+		serverConfig.ClientCAs = serverConfig.RootCAs
+		serverConfig.Time = func() time.Time { return time.Unix(1476984729, 0) }
 
 		clientConfig := testConfig.Clone()
 
-		test.setup(clientConfig)
+		test.setup(clientConfig, serverConfig)
 
 		type serverResult struct {
 			cs  ConnectionState
 			err error
 		}
 
-		c, s := net.Pipe()
+		c, s := localPipe(t)
 		done := make(chan serverResult)
 
 		go func() {
@@ -1553,6 +1584,8 @@ func TestGetClientCertificate(t *testing.T) {
 				t.Errorf("#%d: client error: %v", i, clientErr)
 			} else if got := clientErr.Error(); got != test.expectedClientError {
 				t.Errorf("#%d: expected client error %q, but got %q", i, test.expectedClientError, got)
+			} else {
+				test.verify(t, i, &result.cs)
 			}
 		} else if len(test.expectedClientError) > 0 {
 			t.Errorf("#%d: expected client error %q, but got no error", i, test.expectedClientError)
@@ -1561,5 +1594,63 @@ func TestGetClientCertificate(t *testing.T) {
 		} else {
 			test.verify(t, i, &result.cs)
 		}
+	}
+}
+
+func TestRSAPSSKeyError(t *testing.T) {
+	// crypto/tls does not support the rsa_pss_pss_xxx SignatureSchemes. If support for
+	// public keys with OID RSASSA-PSS is added to crypto/x509, they will be misused with
+	// the rsa_pss_rsae_xxx SignatureSchemes. Assert that RSASSA-PSS certificates don't
+	// parse, or that they don't carry *rsa.PublicKey keys.
+	b, _ := pem.Decode([]byte(`
+-----BEGIN CERTIFICATE-----
+MIIDZTCCAhygAwIBAgIUCF2x0FyTgZG0CC9QTDjGWkB5vgEwPgYJKoZIhvcNAQEK
+MDGgDTALBglghkgBZQMEAgGhGjAYBgkqhkiG9w0BAQgwCwYJYIZIAWUDBAIBogQC
+AgDeMBIxEDAOBgNVBAMMB1JTQS1QU1MwHhcNMTgwNjI3MjI0NDM2WhcNMTgwNzI3
+MjI0NDM2WjASMRAwDgYDVQQDDAdSU0EtUFNTMIIBIDALBgkqhkiG9w0BAQoDggEP
+ADCCAQoCggEBANxDm0f76JdI06YzsjB3AmmjIYkwUEGxePlafmIASFjDZl/elD0Z
+/a7xLX468b0qGxLS5al7XCcEprSdsDR6DF5L520+pCbpfLyPOjuOvGmk9KzVX4x5
+b05YXYuXdsQ0Kjxcx2i3jjCday6scIhMJVgBZxTEyMj1thPQM14SHzKCd/m6HmCL
+QmswpH2yMAAcBRWzRpp/vdH5DeOJEB3aelq7094no731mrLUCHRiZ1htq8BDB3ou
+czwqgwspbqZ4dnMXl2MvfySQ5wJUxQwILbiuAKO2lVVPUbFXHE9pgtznNoPvKwQT
+JNcX8ee8WIZc2SEGzofjk3NpjR+2ADB2u3sCAwEAAaNTMFEwHQYDVR0OBBYEFNEz
+AdyJ2f+fU+vSCS6QzohnOnprMB8GA1UdIwQYMBaAFNEzAdyJ2f+fU+vSCS6Qzohn
+OnprMA8GA1UdEwEB/wQFMAMBAf8wPgYJKoZIhvcNAQEKMDGgDTALBglghkgBZQME
+AgGhGjAYBgkqhkiG9w0BAQgwCwYJYIZIAWUDBAIBogQCAgDeA4IBAQCjEdrR5aab
+sZmCwrMeKidXgfkmWvfuLDE+TCbaqDZp7BMWcMQXT9O0UoUT5kqgKj2ARm2pEW0Z
+H3Z1vj3bbds72qcDIJXp+l0fekyLGeCrX/CbgnMZXEP7+/+P416p34ChR1Wz4dU1
+KD3gdsUuTKKeMUog3plxlxQDhRQmiL25ygH1LmjLd6dtIt0GVRGr8lj3euVeprqZ
+bZ3Uq5eLfsn8oPgfC57gpO6yiN+UURRTlK3bgYvLh4VWB3XXk9UaQZ7Mq1tpXjoD
+HYFybkWzibkZp4WRo+Fa28rirH+/wHt0vfeN7UCceURZEx4JaxIIfe4ku7uDRhJi
+RwBA9Xk1KBNF
+-----END CERTIFICATE-----`))
+	if b == nil {
+		t.Fatal("Failed to decode certificate")
+	}
+	cert, err := x509.ParseCertificate(b.Bytes)
+	if err != nil {
+		return
+	}
+	if _, ok := cert.PublicKey.(*rsa.PublicKey); ok {
+		t.Error("A RSA-PSS certificate was parsed like a PKCS1 one, and it will be mistakenly used with rsa_pss_rsae_xxx signature algorithms")
+	}
+}
+
+func TestCloseClientConnectionOnIdleServer(t *testing.T) {
+	clientConn, serverConn := localPipe(t)
+	client := Client(clientConn, testConfig.Clone())
+	go func() {
+		var b [1]byte
+		serverConn.Read(b[:])
+		client.Close()
+	}()
+	client.SetWriteDeadline(time.Now().Add(time.Second))
+	err := client.Handshake()
+	if err != nil {
+		if err, ok := err.(net.Error); ok && err.Timeout() {
+			t.Errorf("Expected a closed network connection error but got '%s'", err.Error())
+		}
+	} else {
+		t.Errorf("Error expected, but no error returned")
 	}
 }

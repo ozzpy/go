@@ -11,7 +11,6 @@ import (
 	"io"
 	"io/ioutil"
 	"runtime"
-	"sort"
 	"strconv"
 	"time"
 	"unsafe"
@@ -43,29 +42,48 @@ type profileBuilder struct {
 	strings   []string
 	stringMap map[string]int
 	locs      map[uintptr]int
-	funcs     map[*runtime.Func]int
+	funcs     map[string]int // Package path-qualified function name to Function.ID
 	mem       []memMap
 }
 
 type memMap struct {
-	start uintptr
-	end   uintptr
+	// initialized as reading mapping
+	start         uintptr
+	end           uintptr
+	offset        uint64
+	file, buildID string
+
+	funcs symbolizeFlag
+	fake  bool // map entry was faked; /proc/self/maps wasn't available
 }
+
+// symbolizeFlag keeps track of symbolization result.
+//   0                  : no symbol lookup was performed
+//   1<<0 (lookupTried) : symbol lookup was performed
+//   1<<1 (lookupFailed): symbol lookup was performed but failed
+type symbolizeFlag uint8
+
+const (
+	lookupTried  symbolizeFlag = 1 << iota
+	lookupFailed symbolizeFlag = 1 << iota
+)
 
 const (
 	// message Profile
-	tagProfile_SampleType    = 1  // repeated ValueType
-	tagProfile_Sample        = 2  // repeated Sample
-	tagProfile_Mapping       = 3  // repeated Mapping
-	tagProfile_Location      = 4  // repeated Location
-	tagProfile_Function      = 5  // repeated Function
-	tagProfile_StringTable   = 6  // repeated string
-	tagProfile_DropFrames    = 7  // int64 (string table index)
-	tagProfile_KeepFrames    = 8  // int64 (string table index)
-	tagProfile_TimeNanos     = 9  // int64
-	tagProfile_DurationNanos = 10 // int64
-	tagProfile_PeriodType    = 11 // ValueType (really optional string???)
-	tagProfile_Period        = 12 // int64
+	tagProfile_SampleType        = 1  // repeated ValueType
+	tagProfile_Sample            = 2  // repeated Sample
+	tagProfile_Mapping           = 3  // repeated Mapping
+	tagProfile_Location          = 4  // repeated Location
+	tagProfile_Function          = 5  // repeated Function
+	tagProfile_StringTable       = 6  // repeated string
+	tagProfile_DropFrames        = 7  // int64 (string table index)
+	tagProfile_KeepFrames        = 8  // int64 (string table index)
+	tagProfile_TimeNanos         = 9  // int64
+	tagProfile_DurationNanos     = 10 // int64
+	tagProfile_PeriodType        = 11 // ValueType (really optional string???)
+	tagProfile_Period            = 12 // int64
+	tagProfile_Comment           = 13 // repeated int64
+	tagProfile_DefaultSampleType = 14 // int64
 
 	// message ValueType
 	tagValueType_Type = 1 // int64 (string table index)
@@ -169,7 +187,7 @@ func (b *profileBuilder) pbLine(tag int, funcID uint64, line int64) {
 }
 
 // pbMapping encodes a Mapping message to b.pb.
-func (b *profileBuilder) pbMapping(tag int, id, base, limit, offset uint64, file, buildID string) {
+func (b *profileBuilder) pbMapping(tag int, id, base, limit, offset uint64, file, buildID string, hasFuncs bool) {
 	start := b.pb.startMessage()
 	b.pb.uint64Opt(tagMapping_ID, id)
 	b.pb.uint64Opt(tagMapping_Start, base)
@@ -177,66 +195,102 @@ func (b *profileBuilder) pbMapping(tag int, id, base, limit, offset uint64, file
 	b.pb.uint64Opt(tagMapping_Offset, offset)
 	b.pb.int64Opt(tagMapping_Filename, b.stringIndex(file))
 	b.pb.int64Opt(tagMapping_BuildID, b.stringIndex(buildID))
-	// TODO: Set any of HasInlineFrames, HasFunctions, HasFilenames, HasLineNumbers?
-	// It seems like they should all be true, but they've never been set.
+	// TODO: we set HasFunctions if all symbols from samples were symbolized (hasFuncs).
+	// Decide what to do about HasInlineFrames and HasLineNumbers.
+	// Also, another approach to handle the mapping entry with
+	// incomplete symbolization results is to dupliace the mapping
+	// entry (but with different Has* fields values) and use
+	// different entries for symbolized locations and unsymbolized locations.
+	if hasFuncs {
+		b.pb.bool(tagMapping_HasFunctions, true)
+	}
 	b.pb.endMessage(tag, start)
 }
 
 // locForPC returns the location ID for addr.
+// addr must be a return PC. This returns the location of the call.
 // It may emit to b.pb, so there must be no message encoding in progress.
 func (b *profileBuilder) locForPC(addr uintptr) uint64 {
 	id := uint64(b.locs[addr])
 	if id != 0 {
 		return id
 	}
-	f := runtime.FuncForPC(addr)
-	if f != nil && f.Name() == "runtime.goexit" {
+
+	// Expand this one address using CallersFrames so we can cache
+	// each expansion. In general, CallersFrames takes a whole
+	// stack, but in this case we know there will be no skips in
+	// the stack and we have return PCs anyway.
+	frames := runtime.CallersFrames([]uintptr{addr})
+	frame, more := frames.Next()
+	if frame.Function == "runtime.goexit" {
+		// Short-circuit if we see runtime.goexit so the loop
+		// below doesn't allocate a useless empty location.
 		return 0
 	}
-	funcID, lineno := b.funcForPC(addr)
+
+	symbolizeResult := lookupTried
+	if frame.PC == 0 || frame.Function == "" || frame.File == "" || frame.Line == 0 {
+		symbolizeResult |= lookupFailed
+	}
+
+	if frame.PC == 0 {
+		// If we failed to resolve the frame, at least make up
+		// a reasonable call PC. This mostly happens in tests.
+		frame.PC = addr - 1
+	}
+
+	// We can't write out functions while in the middle of the
+	// Location message, so record new functions we encounter and
+	// write them out after the Location.
+	type newFunc struct {
+		id         uint64
+		name, file string
+	}
+	newFuncs := make([]newFunc, 0, 8)
+
 	id = uint64(len(b.locs)) + 1
 	b.locs[addr] = int(id)
 	start := b.pb.startMessage()
 	b.pb.uint64Opt(tagLocation_ID, id)
-	b.pb.uint64Opt(tagLocation_Address, uint64(addr))
-	b.pbLine(tagLocation_Line, funcID, int64(lineno))
-	if len(b.mem) > 0 {
-		i := sort.Search(len(b.mem), func(i int) bool {
-			return b.mem[i].end > addr
-		})
-		if i < len(b.mem) && b.mem[i].start <= addr && addr < b.mem[i].end {
+	b.pb.uint64Opt(tagLocation_Address, uint64(frame.PC))
+	for frame.Function != "runtime.goexit" {
+		// Write out each line in frame expansion.
+		funcID := uint64(b.funcs[frame.Function])
+		if funcID == 0 {
+			funcID = uint64(len(b.funcs)) + 1
+			b.funcs[frame.Function] = int(funcID)
+			newFuncs = append(newFuncs, newFunc{funcID, frame.Function, frame.File})
+		}
+		b.pbLine(tagLocation_Line, funcID, int64(frame.Line))
+		if !more {
+			break
+		}
+		frame, more = frames.Next()
+	}
+	for i := range b.mem {
+		if b.mem[i].start <= addr && addr < b.mem[i].end || b.mem[i].fake {
 			b.pb.uint64Opt(tagLocation_MappingID, uint64(i+1))
+
+			m := b.mem[i]
+			m.funcs |= symbolizeResult
+			b.mem[i] = m
+			break
 		}
 	}
 	b.pb.endMessage(tagProfile_Location, start)
+
+	// Write out functions we found during frame expansion.
+	for _, fn := range newFuncs {
+		start := b.pb.startMessage()
+		b.pb.uint64Opt(tagFunction_ID, fn.id)
+		b.pb.int64Opt(tagFunction_Name, b.stringIndex(fn.name))
+		b.pb.int64Opt(tagFunction_SystemName, b.stringIndex(fn.name))
+		b.pb.int64Opt(tagFunction_Filename, b.stringIndex(fn.file))
+		b.pb.endMessage(tagProfile_Function, start)
+	}
+
 	b.flush()
 	return id
-}
-
-// funcForPC returns the func ID and line number for addr.
-// It may emit to b.pb, so there must be no message encoding in progress.
-func (b *profileBuilder) funcForPC(addr uintptr) (funcID uint64, lineno int) {
-	f := runtime.FuncForPC(addr)
-	if f == nil {
-		return 0, 0
-	}
-	file, lineno := f.FileLine(addr)
-	funcID = uint64(b.funcs[f])
-	if funcID != 0 {
-		return funcID, lineno
-	}
-
-	funcID = uint64(len(b.funcs)) + 1
-	b.funcs[f] = int(funcID)
-	name := f.Name()
-	start := b.pb.startMessage()
-	b.pb.uint64Opt(tagFunction_ID, funcID)
-	b.pb.int64Opt(tagFunction_Name, b.stringIndex(name))
-	b.pb.int64Opt(tagFunction_SystemName, b.stringIndex(name))
-	b.pb.int64Opt(tagFunction_Filename, b.stringIndex(file))
-	b.pb.endMessage(tagProfile_Function, start)
-	b.flush()
-	return funcID, lineno
 }
 
 // newProfileBuilder returns a new profileBuilder.
@@ -252,7 +306,7 @@ func newProfileBuilder(w io.Writer) *profileBuilder {
 		strings:   []string{""},
 		stringMap: map[string]int{"": 0},
 		locs:      map[uintptr]int{},
-		funcs:     map[*runtime.Func]int{},
+		funcs:     map[string]int{},
 	}
 	b.readMapping()
 	return b
@@ -321,7 +375,7 @@ func (b *profileBuilder) addCPUData(data []uint64, tags []unsafe.Pointer) error 
 }
 
 // build completes and returns the constructed profile.
-func (b *profileBuilder) build() error {
+func (b *profileBuilder) build() {
 	b.end = time.Now()
 
 	b.pb.int64Opt(tagProfile_TimeNanos, b.start.UnixNano())
@@ -350,11 +404,14 @@ func (b *profileBuilder) build() error {
 
 		locs = locs[:0]
 		for i, addr := range e.stk {
-			// Addresses from stack traces point to the next instruction after
-			// each call.  Adjust by -1 to land somewhere on the actual call
-			// (except for the leaf, which is not a call).
-			if i > 0 {
-				addr--
+			// Addresses from stack traces point to the
+			// next instruction after each call, except
+			// for the leaf, which points to where the
+			// signal occurred. locForPC expects return
+			// PCs, so increment the leaf address to look
+			// like a return PC.
+			if i == 0 {
+				addr++
 			}
 			l := b.locForPC(addr)
 			if l == 0 { // runtime.goexit
@@ -365,13 +422,17 @@ func (b *profileBuilder) build() error {
 		b.pbSample(values, locs, labels)
 	}
 
+	for i, m := range b.mem {
+		hasFunctions := m.funcs == lookupTried // lookupTried but not lookupFailed
+		b.pbMapping(tagProfile_Mapping, uint64(i+1), uint64(m.start), uint64(m.end), m.offset, m.file, m.buildID, hasFunctions)
+	}
+
 	// TODO: Anything for tagProfile_DropFrames?
 	// TODO: Anything for tagProfile_KeepFrames?
 
 	b.pb.strings(tagProfile_StringTable, b.strings)
 	b.zw.Write(b.pb.data)
 	b.zw.Close()
-	return nil
 }
 
 // readMapping reads /proc/self/maps and writes mappings to b.pb.
@@ -380,6 +441,12 @@ func (b *profileBuilder) build() error {
 func (b *profileBuilder) readMapping() {
 	data, _ := ioutil.ReadFile("/proc/self/maps")
 	parseProcSelfMaps(data, b.addMapping)
+	if len(b.mem) == 0 { // pprof expects a map entry, so fake one.
+		b.addMappingEntry(0, 0, 0, "", "", true)
+		// TODO(hyangah): make addMapping return *memMap or
+		// take a memMap struct, and get rid of addMappingEntry
+		// that takes a bunch of positional arguments.
+	}
 }
 
 func parseProcSelfMaps(data []byte, addMapping func(lo, hi, offset uint64, file, buildID string)) {
@@ -457,6 +524,14 @@ func parseProcSelfMaps(data []byte, addMapping func(lo, hi, offset uint64, file,
 			continue
 		}
 		file := string(line)
+
+		// Trim deleted file marker.
+		deletedStr := " (deleted)"
+		deletedLen := len(deletedStr)
+		if len(file) >= deletedLen && file[len(file)-deletedLen:] == deletedStr {
+			file = file[:len(file)-deletedLen]
+		}
+
 		if len(inode) == 1 && inode[0] == '0' && file == "" {
 			// Huge-page text mappings list the initial fragment of
 			// mapped but unpopulated memory as being inode 0.
@@ -480,6 +555,16 @@ func parseProcSelfMaps(data []byte, addMapping func(lo, hi, offset uint64, file,
 }
 
 func (b *profileBuilder) addMapping(lo, hi, offset uint64, file, buildID string) {
-	b.mem = append(b.mem, memMap{uintptr(lo), uintptr(hi)})
-	b.pbMapping(tagProfile_Mapping, uint64(len(b.mem)), lo, hi, offset, file, buildID)
+	b.addMappingEntry(lo, hi, offset, file, buildID, false)
+}
+
+func (b *profileBuilder) addMappingEntry(lo, hi, offset uint64, file, buildID string, fake bool) {
+	b.mem = append(b.mem, memMap{
+		start:   uintptr(lo),
+		end:     uintptr(hi),
+		offset:  offset,
+		file:    file,
+		buildID: buildID,
+		fake:    fake,
+	})
 }

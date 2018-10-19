@@ -138,7 +138,7 @@ func typeFlatten(l []*ast.Field) []ast.Expr {
 			t = append(t, f.Type)
 			continue
 		}
-		for _ = range f.Names {
+		for range f.Names {
 			t = append(t, f.Type)
 		}
 	}
@@ -166,9 +166,7 @@ func (f *File) matchParams(expect []string, actual []ast.Expr, prefix string) bo
 
 // Does this one type match?
 func (f *File) matchParamType(expect string, actual ast.Expr) bool {
-	if strings.HasPrefix(expect, "=") {
-		expect = expect[1:]
-	}
+	expect = strings.TrimPrefix(expect, "=")
 	// Strip package name if we're in that package.
 	if n := len(f.file.Name.Name); len(expect) > n && expect[:n] == f.file.Name.Name && expect[n] == '.' {
 		expect = expect[n+1:]

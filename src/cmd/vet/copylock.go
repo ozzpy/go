@@ -93,9 +93,16 @@ func checkCopyLocksReturnStmt(f *File, rs *ast.ReturnStmt) {
 
 // checkCopyLocksCallExpr detects lock copy in the arguments to a function call
 func checkCopyLocksCallExpr(f *File, ce *ast.CallExpr) {
-	if id, ok := ce.Fun.(*ast.Ident); ok && f.pkg.types[id].IsBuiltin() {
-		switch id.Name {
-		case "new", "len", "cap":
+	var id *ast.Ident
+	switch fun := ce.Fun.(type) {
+	case *ast.Ident:
+		id = fun
+	case *ast.SelectorExpr:
+		id = fun.Sel
+	}
+	if fun, ok := f.pkg.uses[id].(*types.Builtin); ok {
+		switch fun.Name() {
+		case "new", "len", "cap", "Sizeof":
 			return
 		}
 	}
@@ -227,13 +234,11 @@ func lockPath(tpkg *types.Package, typ types.Type) typePath {
 		return nil
 	}
 
-	// We're looking for cases in which a reference to this type
-	// can be locked, but a value cannot. This differentiates
+	// We're looking for cases in which a pointer to this type
+	// is a sync.Locker, but a value is not. This differentiates
 	// embedded interfaces from embedded values.
-	if plock := types.NewMethodSet(types.NewPointer(typ)).Lookup(tpkg, "Lock"); plock != nil {
-		if lock := types.NewMethodSet(typ).Lookup(tpkg, "Lock"); lock == nil {
-			return []types.Type{typ}
-		}
+	if types.Implements(types.NewPointer(typ), lockerType) && !types.Implements(typ, lockerType) {
+		return []types.Type{typ}
 	}
 
 	nfields := styp.NumFields()
@@ -246,4 +251,16 @@ func lockPath(tpkg *types.Package, typ types.Type) typePath {
 	}
 
 	return nil
+}
+
+var lockerType *types.Interface
+
+// Construct a sync.Locker interface type.
+func init() {
+	nullary := types.NewSignature(nil, nil, nil, false) // func()
+	methods := []*types.Func{
+		types.NewFunc(token.NoPos, nil, "Lock", nullary),
+		types.NewFunc(token.NoPos, nil, "Unlock", nullary),
+	}
+	lockerType = types.NewInterface(methods, nil).Complete()
 }

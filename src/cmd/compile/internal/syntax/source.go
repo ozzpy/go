@@ -124,7 +124,8 @@ redo:
 	// EOF
 	if s.r == s.w {
 		if s.ioerr != io.EOF {
-			s.error(s.ioerr.Error())
+			// ensure we never start with a '/' (e.g., rooted path) in the error message
+			s.error("I/O error: " + s.ioerr.Error())
 		}
 		return -1
 	}
@@ -164,11 +165,12 @@ func (s *source) fill() {
 			s.lit = append(s.lit, s.buf[s.suf:s.r0]...)
 			s.suf = 1 // == s.r0 after slide below
 		}
-		s.offs += s.r0 - 1
-		r := s.r - s.r0 + 1 // last read char plus one byte
-		s.w = r + copy(s.buf[r:], s.buf[s.r:s.w])
-		s.r = r
-		s.r0 = 1
+		n := s.r0 - 1
+		copy(s.buf[:], s.buf[n:s.w])
+		s.offs += n
+		s.r0 = 1 // eqv: s.r0 -= n
+		s.r -= n
+		s.w -= n
 	}
 
 	// read more data: try a limited number of times
@@ -200,6 +202,10 @@ func (s *source) stopLit() []byte {
 	if len(s.lit) > 0 {
 		lit = append(s.lit, lit...)
 	}
-	s.suf = -1 // no pending literal
+	s.killLit()
 	return lit
+}
+
+func (s *source) killLit() {
+	s.suf = -1 // no pending literal
 }

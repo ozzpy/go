@@ -17,6 +17,7 @@ import (
 	"go/build"
 	"go/types"
 	"internal/testenv"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -191,6 +192,24 @@ func vetPlatforms(pp []platform) {
 }
 
 func (p platform) vet() {
+	if p.os == "linux" && (p.arch == "riscv64" || p.arch == "sparc64") {
+		// TODO(tklauser): enable as soon as these ports have fully landed
+		fmt.Printf("skipping %s/%s\n", p.os, p.arch)
+		return
+	}
+
+	if p.os == "windows" && p.arch == "arm" {
+		// TODO(jordanrh1): enable as soon as the windows/arm port has fully landed
+		fmt.Println("skipping windows/arm")
+		return
+	}
+
+	if p.os == "aix" && p.arch == "ppc64" {
+		// TODO(aix): enable as soon as the aix/ppc64 port has fully landed
+		fmt.Println("skipping aix/ppc64")
+		return
+	}
+
 	var buf bytes.Buffer
 	fmt.Fprintf(&buf, "go run main.go -p %s\n", p)
 
@@ -227,6 +246,15 @@ NextLine:
 			continue
 		}
 
+		if strings.HasPrefix(line, "panic: ") {
+			// Panic in vet. Don't filter anything, we want the complete output.
+			parseFailed = true
+			fmt.Fprintf(os.Stderr, "panic in vet (to reproduce: go run main.go -p %s):\n", p)
+			fmt.Fprintln(os.Stderr, line)
+			io.Copy(os.Stderr, stderr)
+			break
+		}
+
 		fields := strings.SplitN(line, ":", 3)
 		var file, lineno, msg string
 		switch len(fields) {
@@ -238,9 +266,9 @@ NextLine:
 		default:
 			if !parseFailed {
 				parseFailed = true
-				fmt.Fprintln(os.Stderr, "failed to parse vet output:")
+				fmt.Fprintf(os.Stderr, "failed to parse %s vet output:\n", p)
 			}
-			fmt.Println(os.Stderr, line)
+			fmt.Fprintln(os.Stderr, line)
 		}
 		msg = strings.TrimSpace(msg)
 

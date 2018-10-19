@@ -7,7 +7,6 @@
 package httptest
 
 import (
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
@@ -17,6 +16,7 @@ import (
 	"net/http"
 	"net/http/internal"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -93,9 +93,6 @@ func NewUnstartedServer(handler http.Handler) *Server {
 	return &Server{
 		Listener: newLocalListener(),
 		Config:   &http.Server{Handler: handler},
-		client: &http.Client{
-			Transport: &http.Transport{},
-		},
 	}
 }
 
@@ -103,6 +100,9 @@ func NewUnstartedServer(handler http.Handler) *Server {
 func (s *Server) Start() {
 	if s.URL != "" {
 		panic("Server already started")
+	}
+	if s.client == nil {
+		s.client = &http.Client{Transport: &http.Transport{}}
 	}
 	s.URL = "http://" + s.Listener.Addr().String()
 	s.wrap()
@@ -117,6 +117,9 @@ func (s *Server) Start() {
 func (s *Server) StartTLS() {
 	if s.URL != "" {
 		panic("Server already started")
+	}
+	if s.client == nil {
+		s.client = &http.Client{Transport: &http.Transport{}}
 	}
 	cert, err := tls.X509KeyPair(internal.LocalhostCert, internal.LocalhostKey)
 	if err != nil {
@@ -221,7 +224,7 @@ func (s *Server) Close() {
 func (s *Server) logCloseHangDebugInfo() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var buf bytes.Buffer
+	var buf strings.Builder
 	buf.WriteString("httptest.Server blocked in Close after 5 seconds, waiting for connections:\n")
 	for c, st := range s.conns {
 		fmt.Fprintf(&buf, "  %T %p %v in state %v\n", c, c, c.RemoteAddr(), st)
@@ -235,7 +238,7 @@ func (s *Server) CloseClientConnections() {
 	nconn := len(s.conns)
 	ch := make(chan struct{}, nconn)
 	for c := range s.conns {
-		s.closeConnChan(c, ch)
+		go s.closeConnChan(c, ch)
 	}
 	s.mu.Unlock()
 

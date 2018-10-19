@@ -21,7 +21,7 @@ type importerTest struct {
 }
 
 func runImporterTest(t *testing.T, imp Importer, initmap map[*types.Package]InitData, test *importerTest) {
-	pkg, err := imp(make(map[string]*types.Package), test.pkgpath)
+	pkg, err := imp(make(map[string]*types.Package), test.pkgpath, ".", nil)
 	if err != nil {
 		t.Error(err)
 		return
@@ -101,7 +101,11 @@ var importerTests = [...]importerTest{
 	{pkgpath: "unicode", name: "IsUpper", want: "func IsUpper(r rune) bool"},
 	{pkgpath: "unicode", name: "MaxRune", want: "const MaxRune untyped rune", wantval: "1114111"},
 	{pkgpath: "imports", wantinits: []string{"imports..import", "fmt..import", "math..import"}},
-	{pkgpath: "alias", name: "IntAlias2", want: "type IntAlias2 = Int"},
+	{pkgpath: "importsar", name: "Hello", want: "var Hello string"},
+	{pkgpath: "aliases", name: "A14", want: "type A14 = func(int, T0) chan T2"},
+	{pkgpath: "aliases", name: "C0", want: "type C0 struct{f1 C1; f2 C1}"},
+	{pkgpath: "escapeinfo", name: "NewT", want: "func NewT(data []byte) *T"},
+	{pkgpath: "issue27856", name: "M", want: "type M struct{E F}"},
 }
 
 func TestGoxImporter(t *testing.T) {
@@ -122,7 +126,6 @@ func TestObjImporter(t *testing.T) {
 	// were compiled with gccgo.
 	if runtime.Compiler != "gccgo" {
 		t.Skip("This test needs gccgo")
-		return
 	}
 
 	tmpdir, err := ioutil.TempDir("", "")

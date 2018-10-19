@@ -25,6 +25,7 @@ type file struct {
 
 // Fd returns the Windows handle referencing the open file.
 // The handle is valid only until f.Close is called or f is garbage collected.
+// On Unix systems this will cause the SetDeadline methods to stop working.
 func (file *File) Fd() uintptr {
 	if file == nil {
 		return uintptr(syscall.InvalidHandle)
@@ -54,7 +55,7 @@ func newFile(h syscall.Handle, name string, kind string) *File {
 
 	// Ignore initialization errors.
 	// Assume any problems will show up in later I/O.
-	f.pfd.Init(kind)
+	f.pfd.Init(kind, false)
 
 	return f
 }
@@ -64,7 +65,9 @@ func newConsoleFile(h syscall.Handle, name string) *File {
 	return newFile(h, name, "console")
 }
 
-// NewFile returns a new File with the given file descriptor and name.
+// NewFile returns a new File with the given file descriptor and
+// name. The returned value will be nil if fd is not a valid file
+// descriptor.
 func NewFile(fd uintptr, name string) *File {
 	h := syscall.Handle(fd)
 	if h == syscall.InvalidHandle {
@@ -84,6 +87,8 @@ type dirInfo struct {
 func epipecheck(file *File, e error) {
 }
 
+// DevNull is the name of the operating system's ``null device.''
+// On Unix-like systems, it is "/dev/null"; on Windows, "NUL".
 const DevNull = "NUL"
 
 func (f *file) isdir() bool { return f != nil && f.dirinfo != nil }
@@ -145,12 +150,8 @@ func openDir(name string) (file *File, err error) {
 	return f, nil
 }
 
-// OpenFile is the generalized open call; most users will use Open
-// or Create instead. It opens the named file with specified flag
-// (O_RDONLY etc.) and perm, (0666 etc.) if applicable. If successful,
-// methods on the returned File can be used for I/O.
-// If there is an error, it will be of type *PathError.
-func OpenFile(name string, flag int, perm FileMode) (*File, error) {
+// openFileNolog is the Windows implementation of OpenFile.
+func openFileNolog(name string, flag int, perm FileMode) (*File, error) {
 	if name == "" {
 		return nil, &PathError{"open", name, syscall.ENOENT}
 	}
@@ -170,7 +171,8 @@ func OpenFile(name string, flag int, perm FileMode) (*File, error) {
 }
 
 // Close closes the File, rendering it unusable for I/O.
-// It returns an error, if any.
+// On files that support SetDeadline, any pending I/O operations will
+// be canceled and return immediately with an error.
 func (file *File) Close() error {
 	if file == nil {
 		return ErrInvalid
@@ -308,23 +310,14 @@ func rename(oldname, newname string) error {
 // It returns the files and an error, if any.
 func Pipe() (r *File, w *File, err error) {
 	var p [2]syscall.Handle
-
-	// See ../syscall/exec.go for description of lock.
-	syscall.ForkLock.RLock()
-	e := syscall.Pipe(p[0:])
+	e := syscall.CreatePipe(&p[0], &p[1], nil, 0)
 	if e != nil {
-		syscall.ForkLock.RUnlock()
 		return nil, nil, NewSyscallError("pipe", e)
 	}
-	syscall.CloseOnExec(p[0])
-	syscall.CloseOnExec(p[1])
-	syscall.ForkLock.RUnlock()
-
 	return newFile(p[0], "|0", "file"), newFile(p[1], "|1", "file"), nil
 }
 
-// TempDir returns the default directory to use for temporary files.
-func TempDir() string {
+func tempDir() string {
 	n := uint32(syscall.MAX_PATH)
 	for {
 		b := make([]uint16, n)
@@ -360,15 +353,10 @@ func Link(oldname, newname string) error {
 // Symlink creates newname as a symbolic link to oldname.
 // If there is an error, it will be of type *LinkError.
 func Symlink(oldname, newname string) error {
-	// CreateSymbolicLink is not supported before Windows Vista
-	if syscall.LoadCreateSymbolicLink() != nil {
-		return &LinkError{"symlink", oldname, newname, syscall.EWINDOWS}
-	}
-
 	// '/' does not work in link's content
 	oldname = fromSlash(oldname)
 
-	// need the exact location of the oldname when its relative to determine if its a directory
+	// need the exact location of the oldname when it's relative to determine if it's a directory
 	destpath := oldname
 	if !isAbs(oldname) {
 		destpath = dirname(newname) + `\` + oldname
@@ -386,11 +374,20 @@ func Symlink(oldname, newname string) error {
 		return &LinkError{"symlink", oldname, newname, err}
 	}
 
-	var flags uint32
+	var flags uint32 = windows.SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
 	if isdir {
 		flags |= syscall.SYMBOLIC_LINK_FLAG_DIRECTORY
 	}
 	err = syscall.CreateSymbolicLink(n, o, flags)
+
+	if err != nil {
+		// the unprivileged create flag is unsupported
+		// below Windows 10 (1703, v10.0.14972). retry without it.
+		flags &^= windows.SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+
+		err = syscall.CreateSymbolicLink(n, o, flags)
+	}
+
 	if err != nil {
 		return &LinkError{"symlink", oldname, newname, err}
 	}

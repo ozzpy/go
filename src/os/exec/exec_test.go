@@ -142,11 +142,11 @@ func TestCatGoodAndBadFile(t *testing.T) {
 	}
 }
 
-func TestNoExistBinary(t *testing.T) {
-	// Can't run a non-existent binary
-	err := exec.Command("/no-exist-binary").Run()
+func TestNoExistExecutable(t *testing.T) {
+	// Can't run a non-existent executable
+	err := exec.Command("/no-exist-executable").Run()
 	if err == nil {
-		t.Error("expected error from /no-exist-binary")
+		t.Error("expected error from /no-exist-executable")
 	}
 }
 
@@ -165,6 +165,58 @@ func TestExitStatus(t *testing.T) {
 		}
 	} else {
 		t.Fatalf("expected *exec.ExitError from exit 42; got %T: %v", err, err)
+	}
+}
+
+func TestExitCode(t *testing.T) {
+	// Test that exit code are returned correctly
+	cmd := helperCommand(t, "exit", "42")
+	cmd.Run()
+	want := 42
+	if runtime.GOOS == "plan9" {
+		want = 1
+	}
+	got := cmd.ProcessState.ExitCode()
+	if want != got {
+		t.Errorf("ExitCode got %d, want %d", got, want)
+	}
+
+	cmd = helperCommand(t, "/no-exist-executable")
+	cmd.Run()
+	want = 2
+	if runtime.GOOS == "plan9" {
+		want = 1
+	}
+	got = cmd.ProcessState.ExitCode()
+	if want != got {
+		t.Errorf("ExitCode got %d, want %d", got, want)
+	}
+
+	cmd = helperCommand(t, "exit", "255")
+	cmd.Run()
+	want = 255
+	if runtime.GOOS == "plan9" {
+		want = 1
+	}
+	got = cmd.ProcessState.ExitCode()
+	if want != got {
+		t.Errorf("ExitCode got %d, want %d", got, want)
+	}
+
+	cmd = helperCommand(t, "cat")
+	cmd.Run()
+	want = 0
+	got = cmd.ProcessState.ExitCode()
+	if want != got {
+		t.Errorf("ExitCode got %d, want %d", got, want)
+	}
+
+	// Test when command does not call Run().
+	cmd = helperCommand(t, "cat")
+	want = -1
+	got = cmd.ProcessState.ExitCode()
+	if want != got {
+		t.Errorf("ExitCode got %d, want %d", got, want)
 	}
 }
 
@@ -334,7 +386,7 @@ func TestPipeLookPathLeak(t *testing.T) {
 	}
 
 	for i := 0; i < 6; i++ {
-		cmd := exec.Command("something-that-does-not-exist-binary")
+		cmd := exec.Command("something-that-does-not-exist-executable")
 		cmd.StdoutPipe()
 		cmd.StderrPipe()
 		cmd.StdinPipe()
@@ -401,9 +453,21 @@ var testedAlreadyLeaked = false
 
 // basefds returns the number of expected file descriptors
 // to be present in a process at start.
-// stdin, stdout, stderr, epoll/kqueue
+// stdin, stdout, stderr, epoll/kqueue, maybe testlog
 func basefds() uintptr {
-	return os.Stderr.Fd() + 1
+	n := os.Stderr.Fd() + 1
+	// The poll (epoll/kqueue) descriptor can be numerically
+	// either between stderr and the testlog-fd, or after
+	// testlog-fd.
+	if poll.PollDescriptor() == n {
+		n++
+	}
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "-test.testlogfile=") {
+			n++
+		}
+	}
+	return n
 }
 
 func closeUnexpectedFds(t *testing.T, m string) {
@@ -877,25 +941,41 @@ func TestHelperProcess(*testing.T) {
 	}
 }
 
+type delayedInfiniteReader struct{}
+
+func (delayedInfiniteReader) Read(b []byte) (int, error) {
+	time.Sleep(100 * time.Millisecond)
+	for i := range b {
+		b[i] = 'x'
+	}
+	return len(b), nil
+}
+
 // Issue 9173: ignore stdin pipe writes if the program completes successfully.
 func TestIgnorePipeErrorOnSuccess(t *testing.T) {
 	testenv.MustHaveExec(t)
 
-	// We really only care about testing this on Unixy things.
-	if runtime.GOOS == "windows" || runtime.GOOS == "plan9" {
+	// We really only care about testing this on Unixy and Windowsy things.
+	if runtime.GOOS == "plan9" {
 		t.Skipf("skipping test on %q", runtime.GOOS)
 	}
 
-	cmd := helperCommand(t, "echo", "foo")
-	var out bytes.Buffer
-	cmd.Stdin = strings.NewReader(strings.Repeat("x", 10<<20))
-	cmd.Stdout = &out
-	if err := cmd.Run(); err != nil {
-		t.Fatal(err)
+	testWith := func(r io.Reader) func(*testing.T) {
+		return func(t *testing.T) {
+			cmd := helperCommand(t, "echo", "foo")
+			var out bytes.Buffer
+			cmd.Stdin = r
+			cmd.Stdout = &out
+			if err := cmd.Run(); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := out.String(), "foo\n"; got != want {
+				t.Errorf("output = %q; want %q", got, want)
+			}
+		}
 	}
-	if got, want := out.String(), "foo\n"; got != want {
-		t.Errorf("output = %q; want %q", got, want)
-	}
+	t.Run("10MB", testWith(strings.NewReader(strings.Repeat("x", 10<<20))))
+	t.Run("Infinite", testWith(delayedInfiniteReader{}))
 }
 
 type badWriter struct{}

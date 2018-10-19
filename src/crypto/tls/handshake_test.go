@@ -13,6 +13,7 @@ import (
 	"io"
 	"io/ioutil"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -32,10 +33,10 @@ import (
 // implementation.
 //
 // Tests can be updated by running them with the -update flag. This will cause
-// the test files. Generally one should combine the -update flag with -test.run
-// to updated a specific test. Since the reference implementation will always
-// generate fresh random numbers, large parts of the reference connection will
-// always change.
+// the test files to be regenerated. Generally one should combine the -update
+// flag with -test.run to updated a specific test. Since the reference
+// implementation will always generate fresh random numbers, large parts of
+// the reference connection will always change.
 
 var (
 	update = flag.Bool("update", false, "update golden files on disk")
@@ -223,4 +224,46 @@ func tempFile(contents string) string {
 	file.WriteString(contents)
 	file.Close()
 	return path
+}
+
+// localListener is set up by TestMain and used by localPipe to create Conn
+// pairs like net.Pipe, but connected by an actual buffered TCP connection.
+var localListener struct {
+	sync.Mutex
+	net.Listener
+}
+
+func localPipe(t testing.TB) (net.Conn, net.Conn) {
+	localListener.Lock()
+	defer localListener.Unlock()
+	c := make(chan net.Conn)
+	go func() {
+		conn, err := localListener.Accept()
+		if err != nil {
+			t.Errorf("Failed to accept local connection: %v", err)
+		}
+		c <- conn
+	}()
+	addr := localListener.Addr()
+	c1, err := net.Dial(addr.Network(), addr.String())
+	if err != nil {
+		t.Fatalf("Failed to dial local connection: %v", err)
+	}
+	c2 := <-c
+	return c1, c2
+}
+
+func TestMain(m *testing.M) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		l, err = net.Listen("tcp6", "[::1]:0")
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to open local listener: %v", err)
+		os.Exit(1)
+	}
+	localListener.Listener = l
+	exitCode := m.Run()
+	localListener.Close()
+	os.Exit(exitCode)
 }

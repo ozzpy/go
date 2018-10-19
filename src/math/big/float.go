@@ -3,7 +3,7 @@
 // license that can be found in the LICENSE file.
 
 // This file implements multi-precision floating-point numbers.
-// Like in the GNU MPFR library (http://www.mpfr.org/), operands
+// Like in the GNU MPFR library (https://www.mpfr.org/), operands
 // can be of mixed precision. Unlike MPFR, the rounding mode is
 // not specified with each operation, but with each operand. The
 // rounding mode of the result operand determines the rounding
@@ -293,7 +293,7 @@ func (z *Float) setExpAndRound(exp int64, sbit uint) {
 	z.round(sbit)
 }
 
-// SetMantExp sets z to mant × 2**exp and and returns z.
+// SetMantExp sets z to mant × 2**exp and returns z.
 // The result z has the same precision and rounding mode
 // as mant. SetMantExp is an inverse of MantExp but does
 // not require 0.5 <= |mant| < 1.0. Specifically:
@@ -415,8 +415,9 @@ func (z *Float) round(sbit uint) {
 	// bits > z.prec: mantissa too large => round
 	r := uint(bits - z.prec - 1) // rounding bit position; r >= 0
 	rbit := z.mant.bit(r) & 1    // rounding bit; be safe and ensure it's a single bit
-	if sbit == 0 {
-		// TODO(gri) if rbit != 0 we don't need to compute sbit for some rounding modes (optimization)
+	// The sticky bit is only needed for rounding ToNearestEven
+	// or when the rounding bit is zero. Avoid computation otherwise.
+	if sbit == 0 && (rbit == 0 || z.mode == ToNearestEven) {
 		sbit = z.mant.sticky(r)
 	}
 	sbit &= 1 // be safe and ensure it's a single bit
@@ -1310,8 +1311,11 @@ func (z *Float) umul(x, y *Float) {
 	// TODO(gri) Optimize this for the common case.
 
 	e := int64(x.exp) + int64(y.exp)
-	z.mant = z.mant.mul(x.mant, y.mant)
-
+	if x == y {
+		z.mant = z.mant.sqr(x.mant)
+	} else {
+		z.mant = z.mant.mul(x.mant, y.mant)
+	}
 	z.setExpAndRound(e-fnorm(z.mant), 0)
 }
 
@@ -1425,8 +1429,6 @@ func (x *Float) ucmp(y *Float) int {
 // z's accuracy reports the result error relative to the exact (not rounded)
 // result. Add panics with ErrNaN if x and y are infinities with opposite
 // signs. The value of z is undefined in that case.
-//
-// BUG(gri) When rounding ToNegativeInf, the sign of Float values rounded to 0 is incorrect.
 func (z *Float) Add(x, y *Float) *Float {
 	if debugFloat {
 		x.validate()
@@ -1439,8 +1441,16 @@ func (z *Float) Add(x, y *Float) *Float {
 
 	if x.form == finite && y.form == finite {
 		// x + y (common case)
+
+		// Below we set z.neg = x.neg, and when z aliases y this will
+		// change the y operand's sign. This is fine, because if an
+		// operand aliases the receiver it'll be overwritten, but we still
+		// want the original x.neg and y.neg values when we evaluate
+		// x.neg != y.neg, so we need to save y.neg before setting z.neg.
+		yneg := y.neg
+
 		z.neg = x.neg
-		if x.neg == y.neg {
+		if x.neg == yneg {
 			// x + y == x + y
 			// (-x) + (-y) == -(x + y)
 			z.uadd(x, y)
@@ -1453,6 +1463,9 @@ func (z *Float) Add(x, y *Float) *Float {
 				z.neg = !z.neg
 				z.usub(y, x)
 			}
+		}
+		if z.form == zero && z.mode == ToNegativeInf && z.acc == Exact {
+			z.neg = true
 		}
 		return z
 	}
@@ -1502,8 +1515,9 @@ func (z *Float) Sub(x, y *Float) *Float {
 
 	if x.form == finite && y.form == finite {
 		// x - y (common case)
+		yneg := y.neg
 		z.neg = x.neg
-		if x.neg != y.neg {
+		if x.neg != yneg {
 			// x - (-y) == x + y
 			// (-x) - y == -(x + y)
 			z.uadd(x, y)
@@ -1516,6 +1530,9 @@ func (z *Float) Sub(x, y *Float) *Float {
 				z.neg = !z.neg
 				z.usub(y, x)
 			}
+		}
+		if z.form == zero && z.mode == ToNegativeInf && z.acc == Exact {
+			z.neg = true
 		}
 		return z
 	}

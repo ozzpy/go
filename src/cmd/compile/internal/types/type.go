@@ -15,11 +15,13 @@ import (
 // TODO(gri) try to eliminate soon
 type Node struct{ _ int }
 
+//go:generate stringer -type EType -trimprefix T
+
 // EType describes a kind of type.
 type EType uint8
 
 const (
-	Txxx = iota
+	Txxx EType = iota
 
 	TINT8
 	TUINT8
@@ -41,9 +43,7 @@ const (
 
 	TBOOL
 
-	TPTR32
-	TPTR64
-
+	TPTR
 	TFUNC
 	TSLICE
 	TARRAY
@@ -130,12 +130,12 @@ type Type struct {
 	// TFORW: *Forward
 	// TFUNC: *Func
 	// TSTRUCT: *Struct
-	// TINTER: *Inter
+	// TINTER: *Interface
 	// TDDDFIELD: DDDField
 	// TFUNCARGS: FuncArgs
 	// TCHANARGS: ChanArgs
 	// TCHAN: *Chan
-	// TPTR32, TPTR64: Ptr
+	// TPTR: Ptr
 	// TARRAY: *Array
 	// TSLICE: Slice
 	Extra interface{}
@@ -162,32 +162,63 @@ type Type struct {
 }
 
 const (
-	typeLocal     = 1 << iota // created in this file
-	typeNotInHeap             // type cannot be heap allocated
+	typeNotInHeap = 1 << iota // type cannot be heap allocated
 	typeBroke                 // broken type definition
 	typeNoalg                 // suppress hash and eq algorithm generation
 	typeDeferwidth
 	typeRecur
 )
 
-func (t *Type) Local() bool      { return t.flags&typeLocal != 0 }
 func (t *Type) NotInHeap() bool  { return t.flags&typeNotInHeap != 0 }
 func (t *Type) Broke() bool      { return t.flags&typeBroke != 0 }
 func (t *Type) Noalg() bool      { return t.flags&typeNoalg != 0 }
 func (t *Type) Deferwidth() bool { return t.flags&typeDeferwidth != 0 }
 func (t *Type) Recur() bool      { return t.flags&typeRecur != 0 }
 
-func (t *Type) SetLocal(b bool)      { t.flags.set(typeLocal, b) }
 func (t *Type) SetNotInHeap(b bool)  { t.flags.set(typeNotInHeap, b) }
 func (t *Type) SetBroke(b bool)      { t.flags.set(typeBroke, b) }
 func (t *Type) SetNoalg(b bool)      { t.flags.set(typeNoalg, b) }
 func (t *Type) SetDeferwidth(b bool) { t.flags.set(typeDeferwidth, b) }
 func (t *Type) SetRecur(b bool)      { t.flags.set(typeRecur, b) }
 
+// Pkg returns the package that t appeared in.
+//
+// Pkg is only defined for function, struct, and interface types
+// (i.e., types with named elements). This information isn't used by
+// cmd/compile itself, but we need to track it because it's exposed by
+// the go/types API.
+func (t *Type) Pkg() *Pkg {
+	switch t.Etype {
+	case TFUNC:
+		return t.Extra.(*Func).pkg
+	case TSTRUCT:
+		return t.Extra.(*Struct).pkg
+	case TINTER:
+		return t.Extra.(*Interface).pkg
+	default:
+		Fatalf("Pkg: unexpected kind: %v", t)
+		return nil
+	}
+}
+
+// SetPkg sets the package that t appeared in.
+func (t *Type) SetPkg(pkg *Pkg) {
+	switch t.Etype {
+	case TFUNC:
+		t.Extra.(*Func).pkg = pkg
+	case TSTRUCT:
+		t.Extra.(*Struct).pkg = pkg
+	case TINTER:
+		t.Extra.(*Interface).pkg = pkg
+	default:
+		Fatalf("Pkg: unexpected kind: %v", t)
+	}
+}
+
 // Map contains Type fields specific to maps.
 type Map struct {
-	Key *Type // Key type
-	Val *Type // Val (elem) type
+	Key  *Type // Key type
+	Elem *Type // Val (elem) type
 
 	Bucket *Type // internal struct type representing a hash bucket
 	Hmap   *Type // internal struct type representing the Hmap (map header object)
@@ -219,6 +250,7 @@ type Func struct {
 	Params   *Type // function params
 
 	Nname *Node
+	pkg   *Pkg
 
 	// Argwid is the total width of the function receiver, params, and results.
 	// It gets calculated via a temporary TFUNCARGS type.
@@ -237,6 +269,7 @@ func (t *Type) FuncType() *Func {
 // StructType contains Type fields specific to struct types.
 type Struct struct {
 	fields Fields
+	pkg    *Pkg
 
 	// Maps have three associated internal structs (see struct MapType).
 	// Map links such structs back to their map type.
@@ -264,6 +297,7 @@ func (t *Type) StructType() *Struct {
 // Interface contains Type fields specific to interface types.
 type Interface struct {
 	Fields Fields
+	pkg    *Pkg
 }
 
 // Ptr contains Type fields specific to pointer types.
@@ -321,18 +355,19 @@ type Field struct {
 	flags bitset8
 
 	Embedded uint8 // embedded field
-	Funarg   Funarg
 
-	Sym   *Sym
+	Pos  src.XPos
+	Sym  *Sym
+	Type *Type  // field type
+	Note string // literal string annotation
+
+	// For fields that represent function parameters, Nname points
+	// to the associated ONAME Node.
 	Nname *Node
-
-	Type *Type // field type
 
 	// Offset in bytes of this field or method within its enclosing struct
 	// or interface Type.
 	Offset int64
-
-	Note string // literal string annotation
 }
 
 const (
@@ -424,7 +459,7 @@ func New(et EType) *Type {
 		t.Extra = new(Struct)
 	case TINTER:
 		t.Extra = new(Interface)
-	case TPTR32, TPTR64:
+	case TPTR:
 		t.Extra = Ptr{}
 	case TCHANARGS:
 		t.Extra = ChanArgs{}
@@ -501,7 +536,7 @@ func NewMap(k, v *Type) *Type {
 	t := New(TMAP)
 	mt := t.MapType()
 	mt.Key = k
-	mt.Val = v
+	mt.Elem = v
 	return t
 }
 
@@ -523,11 +558,7 @@ func NewPtr(elem *Type) *Type {
 		return t
 	}
 
-	if Tptr == 0 {
-		Fatalf("NewPtr: Tptr not initialized")
-	}
-
-	t := New(Tptr)
+	t := New(TPTR)
 	t.Extra = Ptr{Elem: elem}
 	t.Width = int64(Widthptr)
 	t.Align = uint8(Widthptr)
@@ -582,41 +613,41 @@ func SubstAny(t *Type, types *[]*Type) *Type {
 		t = (*types)[0]
 		*types = (*types)[1:]
 
-	case TPTR32, TPTR64:
+	case TPTR:
 		elem := SubstAny(t.Elem(), types)
 		if elem != t.Elem() {
-			t = t.Copy()
+			t = t.copy()
 			t.Extra = Ptr{Elem: elem}
 		}
 
 	case TARRAY:
 		elem := SubstAny(t.Elem(), types)
 		if elem != t.Elem() {
-			t = t.Copy()
+			t = t.copy()
 			t.Extra.(*Array).Elem = elem
 		}
 
 	case TSLICE:
 		elem := SubstAny(t.Elem(), types)
 		if elem != t.Elem() {
-			t = t.Copy()
+			t = t.copy()
 			t.Extra = Slice{Elem: elem}
 		}
 
 	case TCHAN:
 		elem := SubstAny(t.Elem(), types)
 		if elem != t.Elem() {
-			t = t.Copy()
+			t = t.copy()
 			t.Extra.(*Chan).Elem = elem
 		}
 
 	case TMAP:
 		key := SubstAny(t.Key(), types)
-		val := SubstAny(t.Val(), types)
-		if key != t.Key() || val != t.Val() {
-			t = t.Copy()
+		elem := SubstAny(t.Elem(), types)
+		if key != t.Key() || elem != t.Elem() {
+			t = t.copy()
 			t.Extra.(*Map).Key = key
-			t.Extra.(*Map).Val = val
+			t.Extra.(*Map).Elem = elem
 		}
 
 	case TFUNC:
@@ -624,7 +655,7 @@ func SubstAny(t *Type, types *[]*Type) *Type {
 		params := SubstAny(t.Params(), types)
 		results := SubstAny(t.Results(), types)
 		if recvs != t.Recvs() || params != t.Params() || results != t.Results() {
-			t = t.Copy()
+			t = t.copy()
 			t.FuncType().Receiver = recvs
 			t.FuncType().Results = results
 			t.FuncType().Params = params
@@ -645,7 +676,7 @@ func SubstAny(t *Type, types *[]*Type) *Type {
 			nfs[i].Type = nft
 		}
 		if nfs != nil {
-			t = t.Copy()
+			t = t.copy()
 			t.SetFields(nfs)
 		}
 	}
@@ -653,8 +684,8 @@ func SubstAny(t *Type, types *[]*Type) *Type {
 	return t
 }
 
-// Copy returns a shallow copy of the Type.
-func (t *Type) Copy() *Type {
+// copy returns a shallow copy of the Type.
+func (t *Type) copy() *Type {
 	if t == nil {
 		return nil
 	}
@@ -707,6 +738,16 @@ func (t *Type) Recvs() *Type   { return t.FuncType().Receiver }
 func (t *Type) Params() *Type  { return t.FuncType().Params }
 func (t *Type) Results() *Type { return t.FuncType().Results }
 
+func (t *Type) NumRecvs() int   { return t.FuncType().Receiver.NumFields() }
+func (t *Type) NumParams() int  { return t.FuncType().Params.NumFields() }
+func (t *Type) NumResults() int { return t.FuncType().Results.NumFields() }
+
+// IsVariadic reports whether function type t is variadic.
+func (t *Type) IsVariadic() bool {
+	n := t.NumParams()
+	return n > 0 && t.Params().Field(n-1).Isddd()
+}
+
 // Recv returns the receiver of function type t, if any.
 func (t *Type) Recv() *Field {
 	s := t.Recvs()
@@ -723,6 +764,11 @@ var RecvsParamsResults = [3]func(*Type) *Type{
 	(*Type).Recvs, (*Type).Params, (*Type).Results,
 }
 
+// RecvsParams is like RecvsParamsResults, but omits result parameters.
+var RecvsParams = [2]func(*Type) *Type{
+	(*Type).Recvs, (*Type).Params,
+}
+
 // ParamsResults is like RecvsParamsResults, but omits receiver parameters.
 var ParamsResults = [2]func(*Type) *Type{
 	(*Type).Params, (*Type).Results,
@@ -734,17 +780,11 @@ func (t *Type) Key() *Type {
 	return t.Extra.(*Map).Key
 }
 
-// Val returns the value type of map type t.
-func (t *Type) Val() *Type {
-	t.wantEtype(TMAP)
-	return t.Extra.(*Map).Val
-}
-
 // Elem returns the type of elements of t.
-// Usable with pointers, channels, arrays, and slices.
+// Usable with pointers, channels, arrays, slices, and maps.
 func (t *Type) Elem() *Type {
 	switch t.Etype {
-	case TPTR32, TPTR64:
+	case TPTR:
 		return t.Extra.(Ptr).Elem
 	case TARRAY:
 		return t.Extra.(*Array).Elem
@@ -752,6 +792,8 @@ func (t *Type) Elem() *Type {
 		return t.Extra.(Slice).Elem
 	case TCHAN:
 		return t.Extra.(*Chan).Elem
+	case TMAP:
+		return t.Extra.(*Map).Elem
 	}
 	Fatalf("Type.Elem %s", t.Etype)
 	return nil
@@ -769,7 +811,7 @@ func (t *Type) ChanArgs() *Type {
 	return t.Extra.(ChanArgs).T
 }
 
-// FuncArgs returns the channel type for TFUNCARGS type t.
+// FuncArgs returns the func type for TFUNCARGS type t.
 func (t *Type) FuncArgs() *Type {
 	t.wantEtype(TFUNCARGS)
 	return t.Extra.(FuncArgs).T
@@ -1051,9 +1093,9 @@ func (t *Type) cmp(x *Type) Cmp {
 		if c := t.Key().cmp(x.Key()); c != CMPeq {
 			return c
 		}
-		return t.Val().cmp(x.Val())
+		return t.Elem().cmp(x.Elem())
 
-	case TPTR32, TPTR64, TSLICE:
+	case TPTR, TSLICE:
 		// No special cases for these, they are handled
 		// by the general code after the switch.
 
@@ -1151,7 +1193,7 @@ func (t *Type) cmp(x *Type) Cmp {
 		panic(e)
 	}
 
-	// Common element type comparison for TARRAY, TCHAN, TPTR32, TPTR64, and TSLICE.
+	// Common element type comparison for TARRAY, TCHAN, TPTR, and TSLICE.
 	return t.Elem().cmp(x.Elem())
 }
 
@@ -1213,7 +1255,7 @@ func (t *Type) IsComplex() bool {
 // IsPtr reports whether t is a regular Go pointer type.
 // This does not include unsafe.Pointer.
 func (t *Type) IsPtr() bool {
-	return t.Etype == TPTR32 || t.Etype == TPTR64
+	return t.Etype == TPTR
 }
 
 // IsUnsafePtr reports whether t is an unsafe pointer.
@@ -1227,7 +1269,7 @@ func (t *Type) IsUnsafePtr() bool {
 // that consist of a single pointer shaped type.
 // TODO(mdempsky): Should it? See golang.org/issue/15028.
 func (t *Type) IsPtrShaped() bool {
-	return t.Etype == TPTR32 || t.Etype == TPTR64 || t.Etype == TUNSAFEPTR ||
+	return t.Etype == TPTR || t.Etype == TUNSAFEPTR ||
 		t.Etype == TMAP || t.Etype == TCHAN || t.Etype == TFUNC
 }
 
@@ -1264,11 +1306,6 @@ func (t *Type) IsEmptyInterface() bool {
 	return t.IsInterface() && t.NumFields() == 0
 }
 
-func (t *Type) ElemType() *Type {
-	// TODO(josharian): If Type ever moves to a shared
-	// internal package, remove this silly wrapper.
-	return t.Elem()
-}
 func (t *Type) PtrTo() *Type {
 	return NewPtr(t)
 }
@@ -1317,6 +1354,39 @@ func (t *Type) SetNumElem(n int64) {
 	at.Bound = n
 }
 
+type componentsIncludeBlankFields bool
+
+const (
+	IgnoreBlankFields componentsIncludeBlankFields = false
+	CountBlankFields  componentsIncludeBlankFields = true
+)
+
+// NumComponents returns the number of primitive elements that compose t.
+// Struct and array types are flattened for the purpose of counting.
+// All other types (including string, slice, and interface types) count as one element.
+// If countBlank is IgnoreBlankFields, then blank struct fields
+// (and their comprised elements) are excluded from the count.
+// struct { x, y [3]int } has six components; [10]struct{ x, y string } has twenty.
+func (t *Type) NumComponents(countBlank componentsIncludeBlankFields) int64 {
+	switch t.Etype {
+	case TSTRUCT:
+		if t.IsFuncArgStruct() {
+			Fatalf("NumComponents func arg struct")
+		}
+		var n int64
+		for _, f := range t.FieldSlice() {
+			if countBlank == IgnoreBlankFields && f.Sym.IsBlank() {
+				continue
+			}
+			n += f.Type.NumComponents(countBlank)
+		}
+		return n
+	case TARRAY:
+		return t.NumElem() * t.Elem().NumComponents(countBlank)
+	}
+	return 1
+}
+
 // ChanDir returns the direction of a channel type t.
 // The direction will be one of Crecv, Csend, or Cboth.
 func (t *Type) ChanDir() ChanDir {
@@ -1324,10 +1394,12 @@ func (t *Type) ChanDir() ChanDir {
 	return t.Extra.(*Chan).Dir
 }
 
-func (t *Type) IsMemory() bool { return t == TypeMem }
-func (t *Type) IsFlags() bool  { return t == TypeFlags }
-func (t *Type) IsVoid() bool   { return t == TypeVoid }
-func (t *Type) IsTuple() bool  { return t.Etype == TTUPLE }
+func (t *Type) IsMemory() bool {
+	return t == TypeMem || t.Etype == TTUPLE && t.Extra.(*Tuple).second == TypeMem
+}
+func (t *Type) IsFlags() bool { return t == TypeFlags }
+func (t *Type) IsVoid() bool  { return t == TypeVoid }
+func (t *Type) IsTuple() bool { return t.Etype == TTUPLE }
 
 // IsUntyped reports whether t is an untyped type.
 func (t *Type) IsUntyped() bool {
@@ -1344,38 +1416,49 @@ func (t *Type) IsUntyped() bool {
 	return false
 }
 
+// TODO(austin): We probably only need HasHeapPointer. See
+// golang.org/cl/73412 for discussion.
+
 func Haspointers(t *Type) bool {
+	return Haspointers1(t, false)
+}
+
+func Haspointers1(t *Type, ignoreNotInHeap bool) bool {
 	switch t.Etype {
 	case TINT, TUINT, TINT8, TUINT8, TINT16, TUINT16, TINT32, TUINT32, TINT64,
-		TUINT64, TUINTPTR, TFLOAT32, TFLOAT64, TCOMPLEX64, TCOMPLEX128, TBOOL:
+		TUINT64, TUINTPTR, TFLOAT32, TFLOAT64, TCOMPLEX64, TCOMPLEX128, TBOOL, TSSA:
 		return false
 
 	case TARRAY:
 		if t.NumElem() == 0 { // empty array has no pointers
 			return false
 		}
-		return Haspointers(t.Elem())
+		return Haspointers1(t.Elem(), ignoreNotInHeap)
 
 	case TSTRUCT:
 		for _, t1 := range t.Fields().Slice() {
-			if Haspointers(t1.Type) {
+			if Haspointers1(t1.Type, ignoreNotInHeap) {
 				return true
 			}
 		}
 		return false
+
+	case TPTR, TSLICE:
+		return !(ignoreNotInHeap && t.Elem().NotInHeap())
+
+	case TTUPLE:
+		ttup := t.Extra.(*Tuple)
+		return Haspointers1(ttup.first, ignoreNotInHeap) || Haspointers1(ttup.second, ignoreNotInHeap)
 	}
 
 	return true
 }
 
-// HasPointer returns whether t contains heap pointer.
-// This is used for write barrier insertion, so we ignore
+// HasHeapPointer returns whether t contains a heap pointer.
+// This is used for write barrier insertion, so it ignores
 // pointers to go:notinheap types.
-func (t *Type) HasPointer() bool {
-	if t.IsPtr() && t.Elem().NotInHeap() {
-		return false
-	}
-	return Haspointers(t)
+func (t *Type) HasHeapPointer() bool {
+	return Haspointers1(t, true)
 }
 
 func (t *Type) Symbol() *obj.LSym {
@@ -1406,9 +1489,10 @@ func FakeRecvType() *Type {
 }
 
 var (
-	TypeInvalid *Type = newSSA("invalid")
-	TypeMem     *Type = newSSA("mem")
-	TypeFlags   *Type = newSSA("flags")
-	TypeVoid    *Type = newSSA("void")
-	TypeInt128  *Type = newSSA("int128")
+	// TSSA types. Haspointers assumes these are pointer-free.
+	TypeInvalid = newSSA("invalid")
+	TypeMem     = newSSA("mem")
+	TypeFlags   = newSSA("flags")
+	TypeVoid    = newSSA("void")
+	TypeInt128  = newSSA("int128")
 )
